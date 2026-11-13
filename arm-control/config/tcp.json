@@ -1,0 +1,31 @@
+{
+  "_comment": "TCP 预设。probe 用临时针实测后填 L_mm 并置 measured=true；未实测只能预演，禁止实际运动。gripper_* 装回夹爪、卡尺复核后再置 measured=true。",
+  "default": "flange",
+  "presets": {
+    "probe": {
+      "L_mm": 90.0,
+      "yaw_deg": 0.0,
+      "measured": false,
+      "note": "阶段①临时针（笔/竹签缠到 Ø16）；用户卡尺量 L 后填 L_mm 并置 measured=true。90.0 只是旧探针设计值，未实测不得用于实际运动"
+    },
+    "gripper_tip": {
+      "L_mm": 161.65,
+      "yaw_deg": -19.2,
+      "measured": false,
+      "note": "夹爪 v2 指尖（旧 181.5 作废）。70.8° 是托杯孔位不是 ψ；开合方向与 K 孔差 19.2°，K 在 +y_f=90°，开合方向偏 +x_f 侧为 70.8°，TCP x=开合方向−90°=−19.2°（待 B1 复核）。装回夹爪并卡尺复核后置 measured=true"
+    },
+    "gripper_center": {
+      "L_mm": 139.15,
+      "yaw_deg": -19.2,
+      "measured": false,
+      "note": "夹爪 v2 夹持中心（旧 159.0 作废）。ψ 同 gripper_tip：−19.2°，待 B1 复核；装回夹爪后置 measured=true"
+    },
+    "flange": {
+      "L_mm": 0.0,
+      "yaw_deg": 0.0,
+      "measured": true,
+      "note": "空法兰（当前默认，16.2/16.6 P05）"
+    }
+  },
+  "version": "2026-11-09.1"
+}

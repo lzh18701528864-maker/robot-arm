@@ -1,0 +1,18 @@
+{
+  "_comment": "执行器独立后台程序配置。搬到 Linux 小主机时只改这个文件：ecb_ip / bind_host / bind_port / 目录。",
+  "bind_host": "127.0.0.1",
+  "bind_port": 8770,
+  "ecb_ip": "192.168.1.30",
+  "ecb_udp_port": 2000,
+  "local_interface": "",
+  "web_dir": "web",
+  "runs_dir": "runs",
+  "models_dir": "models",
+  "serve_web": true,
+  "state_push_hz": 20,
+  "heartbeat_hz": 5,
+  "heartbeat_timeout_s": 0.5,
+  "control_stale_s": 3.0,
+  "default_exec_mode": "preview",
+  "mock_on_start": false
+}

@@ -1,0 +1,15 @@
+{
+  "_comment": "任务 17.1 夹爪零点（B4AE，ID 7）。零点存在这里；装好丝杠/滑块后不要发位置/速度/电流指令，只允许零扭矩读位置。",
+  "id": 7,
+  "sn4": "B4AE",
+  "model": "QDDLite-NE30-36",
+  "gear": 36.0,
+  "zero_turns": null,
+  "zero_date": "",
+  "sign": 1,
+  "sign_checked": false,
+  "deg_per_mm": 4.775141,
+  "h_soft_limits_mm": [2.5, 39.6],
+  "h_mech_limit_mm": 41.0,
+  "note": "h=0 时两座块在 z=50 相碰；h=(turns-zero_turns)*360/gear/deg_per_mm；贴 2 mm 软垫后下限按 h=2.5"
+}

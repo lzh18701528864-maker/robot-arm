@@ -1,0 +1,107 @@
+<?xml version="1.0"?>
+<!--
+  GLUON 2L6-4L3 六轴臂，阶段一 A 运动学模型。
+
+  单位：长度 m（URDF 惯例），角度 rad；本工程内部换算成 mm / deg 显示。
+  数据来源：运动学参数.md §3（= Mac_agent待办.md §16.1），2026-11-05。
+
+  B 系：原点 = J1 轴与 #32 底座底面交点，+z 向上，+x 指向工作区，
+        +y = z × x（站在底座后方面向 +x，+y 在左手边）。
+  零位：整臂竖直（官方 calibrate 姿态）。所有 link 系零位时与 B 系平行。
+
+  限位：这里写的是要写进电机 EEPROM 的输出端限位（J2 ±110°、J6 ±170°，
+  其余 ±140°）。软件限位在 config/joints.json 里各收 5°。
+-->
+<robot name="gluon_2l6_4l3">
+  <link name="base"/>
+  <link name="link1"/>
+  <link name="link2"/>
+  <link name="link3"/>
+  <link name="link4"/>
+  <link name="link5"/>
+  <link name="link6"/>
+  <link name="flange_link"/>
+  <link name="tcp_probe"/>
+  <link name="tcp_gripper_tip"/>
+  <link name="tcp_gripper_center"/>
+
+  <!-- J1 base -> link1：+z，从上往下看整臂逆时针 -->
+  <joint name="J1" type="revolute">
+    <parent link="base"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.1205" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.443460953" upper="2.443460953" effort="80" velocity="1.047197551"/>
+  </joint>
+
+  <!-- J2 link1 -> link2：+y，上臂向 +x 倾倒；限位 ±110° -->
+  <joint name="J2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 0.1165 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.658062789" upper="1.658062789" effort="80" velocity="1.047197551"/>
+  </joint>
+
+  <!-- J3 link2 -> link3：+y，前臂相对上臂向 +x 弯 -->
+  <joint name="J3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0 0 0.2035" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.443460953" upper="2.443460953" effort="40" velocity="1.047197551"/>
+  </joint>
+
+  <!-- J4 link3 -> link4：+y，J5 电机向 +x 倾 -->
+  <joint name="J4" type="revolute">
+    <parent link="link3"/>
+    <child link="link4"/>
+    <origin xyz="0 -0.0792 0.1730" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.443460953" upper="2.443460953" effort="40" velocity="1.047197551"/>
+  </joint>
+
+  <!-- J5 link4 -> link5：+z，零位时从上往下看 J6 电机连探针逆时针 -->
+  <joint name="J5" type="revolute">
+    <parent link="link4"/>
+    <child link="link5"/>
+    <origin xyz="0 0.0792 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.443460953" upper="2.443460953" effort="40" velocity="1.047197551"/>
+  </joint>
+
+  <!-- J6 link5 -> link6：+y，K 孔从 12 点往 +x 转（操作者看逆时针）；限位 ±170° -->
+  <joint name="J6" type="revolute">
+    <parent link="link5"/>
+    <child link="link6"/>
+    <origin xyz="0 0 0.0792" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.967059728" upper="2.967059728" effort="40" velocity="1.047197551"/>
+  </joint>
+
+  <!-- 法兰：z_f = 工具轴 = link6 的 +y；x_f = -x_6；y_f = +z_6 -->
+  <joint name="flange" type="fixed">
+    <parent link="link6"/>
+    <child link="flange_link"/>
+    <origin xyz="0 0.0275 0" rpy="1.5707963268 0 3.1415926536"/>
+  </joint>
+
+  <!-- TCP 预设。位置都沿法兰 z_f（工具轴），偏航 ψ 由程序另加。
+       probe: L=90.0（打印后按实测改 config/tcp.json）
+       gripper_tip: 181.5 ; gripper_center: 159.0 -->
+  <joint name="tcp_probe" type="fixed">
+    <parent link="flange_link"/>
+    <child link="tcp_probe"/>
+    <origin xyz="0 0 0.0900" rpy="0 0 0"/>
+  </joint>
+  <joint name="tcp_gripper_tip" type="fixed">
+    <parent link="flange_link"/>
+    <child link="tcp_gripper_tip"/>
+    <origin xyz="0 0 0.1815" rpy="0 0 0"/>
+  </joint>
+  <joint name="tcp_gripper_center" type="fixed">
+    <parent link="flange_link"/>
+    <child link="tcp_gripper_center"/>
+    <origin xyz="0 0 0.1590" rpy="0 0 0"/>
+  </joint>
+</robot>

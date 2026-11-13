@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>GLUON 2L6-4L3 · 阶段一 A</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="./style.css">
+<script type="importmap">
+{"imports": {"three": "./vendor/three.module.js"}}
+</script>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">
+      <span class="dot" id="conn-dot"></span>
+      <b>GLUON 2L6-4L3</b>
+      <span class="sub">阶段一 A · 运动学 / 虚拟点击</span>
+    </div>
+    <div class="hdr-mid" id="hdr-msg">未连接</div>
+    <div class="hdr-right">
+      <span class="pill" id="pill-webver">网页 —</span>
+      <span class="pill" id="pill-control">控制权 —</span>
+      <span class="pill" id="pill-mode">—</span>
+    </div>
+  </header>
+
+  <main>
+    <aside id="left">
+      <section class="card">
+        <h3>连接</h3>
+        <div class="row">
+          <select id="mode">
+            <option value="hw">真机（ECB 网口）</option>
+            <option value="mock">模拟（无硬件）</option>
+          </select>
+        </div>
+        <div class="row">
+          <input id="ip" value="192.168.1.30" spellcheck="false">
+          <button id="btn-connect" class="btn">连接</button>
+        </div>
+        <div class="row">
+          <button id="btn-acquire" class="btn" style="width:100%" disabled>重新取得控制权</button>
+        </div>
+        <div class="row">
+          <button id="btn-enable" class="btn primary" disabled>使能（J6→J1）</button>
+        </div>
+        <div class="row">
+          <button id="btn-reenable" class="btn" disabled>重新使能（恢复 S 曲线）</button>
+        </div>
+        <div class="row">
+          <button id="btn-clear-errors" class="btn" disabled>清除全部报警（零扭矩，不出力）</button>
+        </div>
+        <div class="hint" id="connect-hint">连接只做握手/枚举/ID↔SN 核对，不动电机。</div>
+        <div class="hint" id="readonly-note" style="display:none;color:#ffd166">只读：另一个页面持有控制权。</div>
+        <div class="hint" id="offline-note" style="display:none;color:#ffd166">未连接：启动/连接执行器后按钮才会启用。</div>
+        <div id="safe-check" class="safe-check unknown">安全限位：未连接</div>
+      </section>
+
+      <section class="card">
+        <h3>校准（16.3）</h3>
+        <button id="btn-calib" class="btn primary" style="width:100%">打开校准向导（J6→J1）</button>
+        <div class="row" style="margin-top:6px">
+          <button id="btn-write-limits" class="btn" style="width:100%">按配置写限位/限速（不动零位）</button>
+        </div>
+        <div class="hint" id="calib-hint">逐颗设零 + 方向核对。P03 把 J2 改成 EEPROM ±95°、软件 ±90°；安全限位再收 2°：J1/J3/J4/J5 ±133°、J2 ±88°、J6 ±163°，启动/运动中超限直接停。</div>
+      </section>
+
+      <section class="card">
+        <h3>Kt 标定（18.4）</h3>
+        <button id="btn-kt" class="btn" style="width:100%">打开 Kt 标定向导</button>
+        <div class="hint">和 16.6 第 6 条同一次做：每个姿态保持 2 s，取 20 个电流样本。</div>
+      </section>
+
+      <section class="card">
+        <h3>手动测量</h3>
+        <button id="btn-measure" class="btn" style="width:100%">打开拖动测量</button>
+        <div class="hint">零扭矩拖动末端，读由电机读数算出的 TCP，和实际点对比。</div>
+      </section>
+
+      <section class="card">
+        <h3>TCP / 偏航</h3>
+        <div class="row">
+          <select id="tcp-preset">
+            <option value="flange" selected>flange（空法兰 L=0，当前）</option>
+            <option value="probe">probe（临时针，实测前只能预演）</option>
+            <option value="gripper_tip">gripper_tip（161.65，未装）</option>
+            <option value="gripper_center">gripper_center（139.15，未装）</option>
+          </select>
+        </div>
+        <label class="slider-row">偏航 ψ
+          <input id="yaw" type="range" min="-180" max="180" step="1" value="0">
+          <output id="yaw-val">0°</output>
+        </label>
+        <label class="check" style="margin-top:8px">
+          <input type="checkbox" id="gizmo-mode">
+          <span>3D 拖动末端（红/绿/蓝三轴抓手）</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="gizmo-free-yaw" checked>
+          <span>偏航自由（3D 拖动时允许手腕绕工具轴转；夹爪开合方向不锁定）</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="gizmo-limit" checked>
+          <span>限制在可达区（越界自动夹回；松手不可达退回上一个绿点）</span>
+        </label>
+        <div class="row">
+          <button id="gizmo-reset" class="btn" style="width:100%">抓手回到当前 TCP</button>
+        </div>
+        <div class="row">
+          <button id="gizmo-safe" class="btn" style="width:100%">抓手放到安全点 (300, 0, 200)</button>
+        </div>
+        <div class="hint">3D 模式：拖红/绿/蓝箭头改 x/y/z，松手后按当前模式预演或直接执行；关掉后仍可点网格（z=20）。</div>
+      </section>
+
+      <section class="card">
+        <h3>末端 / 载荷（18.2）</h3>
+        <div class="row">
+          <select id="ee">
+            <option value="flange" selected>flange（空法兰）</option>
+            <option value="probe">probe（临时针）</option>
+            <option value="gripper">gripper（夹爪 v2，0.45 kg）</option>
+          </select>
+        </div>
+        <div class="row">
+          <span class="muted" style="font-size:11px">载荷 kg</span>
+          <input id="payload" type="number" min="0" step="0.05" value="0" style="width:80px">
+          <button id="btn-ee" class="btn">应用</button>
+        </div>
+        <div id="ee-info" class="kv"><span class="muted">—</span></div>
+        <div class="hint">容量按回读限流 × Kt 算；带爪之前 J2 必须是 6 A。载荷按夹持中心（法兰外 139.15）算。</div>
+      </section>
+
+      <section class="card">
+        <h3>动作</h3>
+        <div class="row two mode-toggle">
+          <button id="mode-preview" class="btn">预演</button>
+          <button id="mode-direct" class="btn">直接执行</button>
+        </div>
+        <div class="hint" id="mode-hint">预演：只算不发，点“执行”也只画预览。</div>
+        <div class="row two">
+          <button id="btn-exec" class="btn primary" disabled>执行</button>
+          <button id="btn-stop" class="btn danger" disabled>停</button>
+        </div>
+        <div class="hint" id="plan-state">还没有计划：先点回零位/拖到可达点或点网格。</div>
+        <div class="row two">
+          <button id="btn-home" class="btn" disabled>回零位</button>
+          <button id="btn-park" class="btn danger" disabled>停机（18.3）</button>
+        </div>
+        <div class="hint" id="home-hint">在搁架上/围栏外时，普通点动和点击会被拒绝；要回零：切“直接执行”，点回零位两次（第一次预演，第二次执行）。</div>
+        <div class="row">
+          <button id="btn-home-plan" class="btn primary" style="width:100%" disabled>生成回零计划（预演，不动电机）</button>
+        </div>
+        <div class="row">
+          <button id="btn-park-teach" class="btn" style="width:100%" disabled>记录当前停机位置（不运动）</button>
+        </div>
+        <div class="hint" id="park-teach-hint">先把臂移到搁架上的停机位置并保持，再点记录；会覆盖 config/park.json 的 poses.park。</div>
+        <div style="margin-top:6px">
+          <label class="check"><input type="checkbox" id="pk-empty" checked><span>夹爪里没有东西</span></label>
+          <label class="check"><input type="checkbox" id="pk-clear"><span>工作区已清空</span></label>
+          <label class="check"><input type="checkbox" id="pk-shelf"><span>搁架已放好、垫片调好</span></label>
+        </div>
+        <div class="row two">
+          <button id="btn-unpark" class="btn" disabled>抬回预停机点</button>
+          <button id="btn-recover" class="btn" disabled>恢复（中止保持后）</button>
+        </div>
+        <div class="row">
+          <button id="btn-support-park" class="btn danger" style="width:100%" disabled>扶持停机（零位 + 人扶住 + 二次确认）</button>
+        </div>
+        <div class="row">
+          <button id="btn-disable-all" class="btn danger" style="width:100%" disabled>紧急全部失能（立即断使能，臂会掉）</button>
+        </div>
+        <div class="hint" style="color:#ff8a8a">紧急失能不走搁架停机，任何姿态都立即断使能；必须先把臂支撑/扶住。能用停机/扶持停机时优先用它们。</div>
+        <div class="hint" id="park-hint">停机 = 搁架接住 → 按 J6→J1 失能。扶持停机是备用（要人扶住零位）。</div>
+        <div class="hint" id="motion-hint">空格键 = 停（任何状态）。</div>
+      </section>
+
+      <section class="card">
+        <h3>点动（输出端角度）</h3>
+        <label class="check" style="margin-bottom:6px">
+          <input type="checkbox" id="jog-live">
+          <span>点动直接执行（会动电机；每步 ≤5°，需逐次确认）</span>
+        </label>
+        <div id="jog" class="jog-grid"></div>
+        <div class="hint">每个关节 ±1°/±5°；同样走围栏检查。</div>
+      </section>
+    </aside>
+
+    <div id="stage">
+      <canvas id="view"></canvas>
+      <div id="gizmo-hud" class="hidden">
+        <div>目标&nbsp; x <b id="gh-x">—</b>&nbsp; y <b id="gh-y">—</b>&nbsp; z <b id="gh-z">—</b> mm</div>
+        <div id="gh-status" class="check">—</div>
+      </div>
+      <div id="legend">
+        <span class="lg x">x</span><span class="lg y">y</span><span class="lg z">z</span>
+        <span class="sep">|</span>
+        <span>实心 = 实际姿态</span><span class="prev">半透明 = 预览</span>
+      </div>
+      <div id="click-hint">在网格上单击 = 虚拟点击（目标 z=20）</div>
+    </div>
+
+    <aside id="right">
+      <section class="card">
+        <h3>本次点击</h3>
+        <div id="target-info" class="kv"><span class="muted">还没有点击</span></div>
+      </section>
+
+      <section class="card">
+        <h3>力矩 / 停机（18.2 / 18.3）</h3>
+        <div id="torque-info" class="kv"><span class="muted">—</span></div>
+        <div id="park-info" class="kv" style="margin-top:4px"></div>
+        <div id="park-block" class="hint" style="display:none;color:#ff8a8a;margin-top:4px"></div>
+        <button id="btn-park-ack" class="btn danger" style="width:100%;display:none;margin-top:4px">已确认（看过实物，解除运动拦截）</button>
+      </section>
+
+      <section class="card">
+        <h3>围栏 / 限位</h3>
+        <div id="fence-info" class="kv"><span class="muted">—</span></div>
+      </section>
+
+      <section class="card grow">
+        <h3>关节</h3>
+        <table id="joints">
+          <thead><tr><th>关节</th><th>角度°</th><th>目标°</th><th>电流 A</th><th>温度</th><th>状态</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h3>日志</h3>
+        <div id="log" class="log"></div>
+      </section>
+    </aside>
+  </main>
+
+  <div id="calib-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <b>16.3 设零 + 方向核对</b>
+        <button id="calib-close" class="btn" style="padding:2px 9px">关闭</button>
+      </div>
+      <div id="calib-body"></div>
+    </div>
+  </div>
+
+  <div id="measure-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <b>手动拖动测量</b>
+        <button id="measure-close" class="btn" style="padding:2px 9px">关闭</button>
+      </div>
+      <div id="measure-body">
+        <div class="calib-note warn" style="border-left-color:#ff5f6d">
+          零扭矩拖动 = 所有关节输出 0 A，<b>臂会在重力下掉</b>。必须用手扶住/支撑好末端，
+          人站在直流空开旁。这里只读位置，不发运动命令。
+        </div>
+        <div class="calib-live">
+          <div><span>TCP x (mm)</span><b id="m-x">—</b></div>
+          <div><span>TCP y (mm)</span><b id="m-y">—</b></div>
+          <div><span>TCP z (mm)</span><b id="m-z">—</b></div>
+          <div><span>TCP 预设</span><b id="m-preset" style="font-size:14px">—</b></div>
+          <div><span>拖动状态</span><b id="m-state" style="font-size:14px">—</b></div>
+        </div>
+        <div class="calib-actions">
+          <button id="m-start" class="btn primary">开始零扭矩拖动</button>
+          <button id="m-stop" class="btn danger">锁定保持（退出拖动）</button>
+          <button id="m-record" class="btn">记录当前 TCP</button>
+        </div>
+        <div class="calib-note">
+          记录用的是当前 TCP 预设（先在上方 TCP 下拉里选对），实际坐标可不填；
+          填了就会算三轴偏差。建议把末端放到网格已知点上（例如 x=300, y=0, z=0）。
+        </div>
+        <div class="row" style="margin-top:8px">
+          <span class="muted" style="font-size:11px">实际点</span>
+          <input id="m-ax" placeholder="实际 x" style="width:88px">
+          <input id="m-ay" placeholder="实际 y" style="width:88px">
+          <input id="m-az" placeholder="实际 z" style="width:88px">
+          <button id="m-clear" class="btn" style="margin-left:auto">清空记录</button>
+        </div>
+        <table id="m-table" style="width:100%;border-collapse:collapse;font-size:11px;margin-top:8px">
+          <thead><tr><th>#</th><th>时间</th><th>TCP (x,y,z)</th><th>实际</th><th>偏差 mm</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="kt-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <b>18.4 Kt 标定</b>
+        <button id="kt-close" class="btn" style="padding:2px 9px">关闭</button>
+      </div>
+      <div id="kt-body">
+        <div class="calib-note warn" style="border-left-color:#ff5f6d">
+          挂重只在<b>保持状态</b>下加减，人在关节侧面，不要站在臂的 +x 方向。
+          每个点到位后停 2 s 再采样。J4 挂到 1 kg 如果保持不住（位置误差 &gt;0.5° 且电流不再上升），
+          <b>不要改 J4 限流</b>，记下电流平台值报给用户。
+        </div>
+        <div class="calib-actions">
+          <button id="kt-refresh" class="btn">读标定点</button>
+          <button id="kt-reset" class="btn">清空采样</button>
+        </div>
+        <div id="kt-points" style="margin-top:6px"></div>
+        <div class="row" style="margin-top:8px">
+          <span class="muted" style="font-size:11px">挂重 kg</span>
+          <input id="kt-load" type="number" min="0" step="0.05" value="0" style="width:76px">
+          <span class="muted" style="font-size:11px">关节</span>
+          <input id="kt-joints" value="J2" style="width:110px">
+          <button id="kt-sample" class="btn primary">采样（当前姿态）</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <button id="kt-fit" class="btn">拟合并保存 config/kt.json</button>
+        </div>
+        <div id="kt-rows" style="margin-top:8px;font-size:11px"></div>
+        <div id="kt-fit-out" style="margin-top:6px;font-size:11px"></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <span id="foot-left">B 系：原点 = J1 轴 ∩ 木板；+x 指向工作区，+y 在左手边</span>
+    <span id="foot-right"></span>
+  </footer>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

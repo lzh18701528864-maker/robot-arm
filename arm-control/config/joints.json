@@ -1,0 +1,182 @@
+{
+  "_comment": "关节配置文件（16.3 第 4 条）。sign / zero_date 在 16.3 设零后填；现在先按 +1 占位。限位单位：输出端 deg。",
+  "gear_ratio": 36.0,
+  "joint_order": [
+    "J1",
+    "J2",
+    "J3",
+    "J4",
+    "J5",
+    "J6"
+  ],
+  "joints": {
+    "J1": {
+      "id": 1,
+      "sn4": "2D55",
+      "model": "QDD-PR60-36",
+      "sign": -1,
+      "offset_deg": 0.0,
+      "eeprom_limits_deg": [
+        -140.0,
+        140.0
+      ],
+      "soft_limits_deg": [
+        -135.0,
+        135.0
+      ],
+      "eeprom_speed_limit_out_deg_s": 60.0,
+      "motion_speed_deg_s": 20.0,
+      "motion_accel_time_s": 0.5,
+      "required_current_limit_a": 3.0,
+      "current_check_max_a": 3.5,
+      "zero_date": "2026-11-08",
+      "note": "J1 比机械限位 ±153° 收窄；限流 3 A = 33 A 的 9%",
+      "sign_checked": true,
+      "safe_limits_deg": [
+        -133.0,
+        133.0
+      ]
+    },
+    "J2": {
+      "id": 2,
+      "sn4": "9F2E",
+      "model": "QDD-PR60-36",
+      "sign": -1,
+      "offset_deg": 0.0,
+      "eeprom_limits_deg": [
+        -95.0,
+        95.0
+      ],
+      "soft_limits_deg": [
+        -90.0,
+        90.0
+      ],
+      "eeprom_speed_limit_out_deg_s": 60.0,
+      "motion_speed_deg_s": 20.0,
+      "motion_accel_time_s": 0.5,
+      "required_current_limit_a": 4.0,
+      "current_check_max_a": 4.5,
+      "zero_date": "2026-11-08",
+      "note": "J2 ±95°（P03）；限流 4 A；P08 起启动阈值按 #0/#16 支架材料：PLA 4.5 A / PETG100 6.5 A（字段 j2_bracket）",
+      "sign_checked": true,
+      "safe_limits_deg": [
+        -88.0,
+        88.0
+      ],
+      "j2_bracket": "PLA"
+    },
+    "J3": {
+      "id": 3,
+      "sn4": "D2C4",
+      "model": "QDD-NE30-36",
+      "sign": 1,
+      "offset_deg": 0.0,
+      "eeprom_limits_deg": [
+        -140.0,
+        140.0
+      ],
+      "soft_limits_deg": [
+        -135.0,
+        135.0
+      ],
+      "eeprom_speed_limit_out_deg_s": 60.0,
+      "motion_speed_deg_s": 20.0,
+      "motion_accel_time_s": 0.5,
+      "required_current_limit_a": 8.0,
+      "current_check_max_a": null,
+      "factory_current_limit_a": 8.0,
+      "factory_current_limit_note": "8 A 是出厂值（16.5 A 满量程的 48%），不动",
+      "zero_date": "2026-11-08",
+      "note": "J3 限流保持出厂 8 A",
+      "sign_checked": true,
+      "safe_limits_deg": [
+        -133.0,
+        133.0
+      ]
+    },
+    "J4": {
+      "id": 4,
+      "sn4": "F1FE",
+      "model": "QDDLite-NE30-36",
+      "sign": -1,
+      "offset_deg": 0.0,
+      "eeprom_limits_deg": [
+        -140.0,
+        140.0
+      ],
+      "soft_limits_deg": [
+        -135.0,
+        135.0
+      ],
+      "eeprom_speed_limit_out_deg_s": 60.0,
+      "motion_speed_deg_s": 20.0,
+      "motion_accel_time_s": 0.5,
+      "required_current_limit_a": null,
+      "current_check_max_a": null,
+      "zero_date": "2026-11-07",
+      "note": "Lite NE30；满量程自报不可信，限流一律不动",
+      "sign_checked": true,
+      "safe_limits_deg": [
+        -133.0,
+        133.0
+      ]
+    },
+    "J5": {
+      "id": 5,
+      "sn4": "BB07",
+      "model": "QDDLite-NE30-36",
+      "sign": -1,
+      "offset_deg": 0.0,
+      "eeprom_limits_deg": [
+        -140.0,
+        140.0
+      ],
+      "soft_limits_deg": [
+        -135.0,
+        135.0
+      ],
+      "eeprom_speed_limit_out_deg_s": 60.0,
+      "motion_speed_deg_s": 20.0,
+      "motion_accel_time_s": 0.5,
+      "required_current_limit_a": null,
+      "current_check_max_a": null,
+      "zero_date": "2026-11-07",
+      "note": "Lite NE30；限流不动",
+      "sign_checked": true,
+      "safe_limits_deg": [
+        -133.0,
+        133.0
+      ]
+    },
+    "J6": {
+      "id": 6,
+      "sn4": "B5B0",
+      "model": "QDDLite-NE30-36",
+      "sign": -1,
+      "offset_deg": 0.0,
+      "eeprom_limits_deg": [
+        -170.0,
+        170.0
+      ],
+      "soft_limits_deg": [
+        -165.0,
+        165.0
+      ],
+      "eeprom_speed_limit_out_deg_s": 60.0,
+      "motion_speed_deg_s": 20.0,
+      "motion_accel_time_s": 0.5,
+      "required_current_limit_a": null,
+      "current_check_max_a": null,
+      "zero_date": "2026-11-07",
+      "note": "J6 ±170°（夹爪线会跟着转）；限流不动",
+      "sign_checked": true,
+      "safe_limits_deg": [
+        -163.0,
+        163.0
+      ]
+    }
+  },
+  "version": "2026-11-10.1",
+  "expected_count": 6,
+  "gripper_installed": false
+}
