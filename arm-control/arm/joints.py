@@ -144,6 +144,8 @@ class JointBus:
         self._targets: dict[str, float] = {}
         self._last_state: dict[str, JointState] = {}
         self._error_tick = 0
+        # 20.5：启动/写限位/校准时真正回读的限流（A），不拿配置值冒充
+        self.current_limit_readback: dict[str, float | None] = {}
 
     def reload_config(self, cfg: dict | None = None):
         """重新读 config/joints.json（sign/offset/限位），不重建电机连接。"""
@@ -267,6 +269,7 @@ class JointBus:
                     round(tel.pos_limit_hi_r * DEG_PER_MOTOR_TURN, 1)],
                 "voltage_v": None if v is None else round(v, 2),
             })
+            self.current_limit_readback[name] = tel.current_limit_a
             if c.required_current_limit_a is not None and tel.current_limit_a is not None:
                 if abs(tel.current_limit_a - c.required_current_limit_a) > 0.15:
                     report["warnings"].append(
@@ -446,7 +449,7 @@ class JointBus:
             if full:
                 # 状态页只需要电压/温度/模式/电流；限流/速度/限位在启动报告里已有
                 specs = [(R_VOLTAGE, 2), (R_TEMP_MOTOR, 2), (R_MODE, 1),
-                         (R_CURRENT_MAX, 2), (R_CURRENT, 4)]
+                         (R_CURRENT_MAX, 2), (R_CURRENT, 4), (R_CURRENT_LIMIT, 4)]
                 for cmd, n in specs:
                     full_maps[cmd] = batch(cmd, n, size=2)
             for mid, name in ids:
@@ -472,6 +475,7 @@ class JointBus:
                         st.out_deg = c.out_deg(p)
                         self._enabled_cache[name] = True
                 st.target_deg = self._targets.get(name)
+                st.current_limit_a = self.current_limit_readback.get(name)
 
                 de = err.get((mid, R_ERROR))
                 if de is not None:
@@ -495,6 +499,12 @@ class JointBus:
                     st.mode = md
                     cur = u(R_CURRENT, ">i")
                     st.current_a = None if cur is None or cm is None else cur / IQ24 * cm
+                    cl = u(R_CURRENT_LIMIT, ">i")
+                    if cl is not None and cm is not None:
+                        st.current_limit_a = cl / IQ24 * cm
+                        self.current_limit_readback[name] = st.current_limit_a
+                    else:
+                        st.current_limit_a = self.current_limit_readback.get(name)
                 out[name] = st
                 self._last_state[name] = st
         return out
@@ -517,22 +527,59 @@ class JointBus:
                 self.motors[name].set_profile_out(vel[name], a, a)
 
     def verify_ready(self, names=None) -> list[tuple[str, str]]:
-        """检查每颗：电源必须为 1，模式必须为 S 曲线位置 6。"""
+        """检查每颗：电源必须为 1，模式必须为 S 曲线位置 6。
+
+        20.2：批量读丢了的，按颗单独再问一次（单条、带重试）；仍读不到
+        才算坏，并把“读不到”和“读到了但值不对”分开报。
+        """
         names = list(names or self.order)
         ids = [(self.motors[n].mid, n) for n in names]
         power, mode = {}, {}
         for i in range(0, len(ids), 2):
             chunk = ids[i:i + 2]
-            power.update(self.link.read_many(
-                [(mid, R_POWER, 1) for mid, _ in chunk], timeout=0.06, retries=2))
-            mode.update(self.link.read_many(
-                [(mid, R_MODE, 1) for mid, _ in chunk], timeout=0.06, retries=2))
+            try:
+                power.update(self.link.read_many(
+                    [(mid, R_POWER, 1) for mid, _ in chunk], timeout=0.06, retries=2))
+                mode.update(self.link.read_many(
+                    [(mid, R_MODE, 1) for mid, _ in chunk], timeout=0.06, retries=2))
+            except Exception:  # noqa: BLE001
+                # 通信异常按“读不到”处理，交给单颗重试/上层中止
+                pass
+
+        def single(mid: int, cmd: int) -> int | None:
+            # 20.2：单条再问，最多 12 次短超时。30% 丢包时 0.3^13 ≈ 1.6e-7，
+            # 200 次起步 × 12 个字段的理论误判上限约 4e-4 次。
+            for _ in range(12):
+                try:
+                    d = self.link.read(mid, cmd, 1, timeout=0.06, retries=1)
+                except Exception:  # noqa: BLE001
+                    d = None
+                if d:
+                    return d[0]
+            return None
+
         bad: list[tuple[str, str]] = []
         for mid, name in ids:
-            p = (power.get((mid, R_POWER)) or b"\xff")[0]
-            m = (mode.get((mid, R_MODE)) or b"\xff")[0]
-            if p != 1 or m != MODE_PROFILE_POSITION:
-                bad.append((name, f"power={p},mode={m}"))
+            p = (power.get((mid, R_POWER)) or b"")[:1]
+            m = (mode.get((mid, R_MODE)) or b"")[:1]
+            p = p[0] if p else None
+            m = m[0] if m else None
+            if p is None:
+                p = single(mid, R_POWER)
+            if m is None:
+                m = single(mid, R_MODE)
+            if p is None and m is None:
+                bad.append((name, "读不到电源(0x2B)和模式(0x55)"))
+            elif p is None:
+                bad.append((name, "读不到电源(0x2B)"))
+            elif m is None:
+                bad.append((name, "读不到模式(0x55)"))
+            elif p != 1 and m != MODE_PROFILE_POSITION:
+                bad.append((name, f"读到了但 power={p},mode={m}"))
+            elif p != 1:
+                bad.append((name, f"读到了但 power={p}"))
+            elif m != MODE_PROFILE_POSITION:
+                bad.append((name, f"读到了但 mode={m}"))
         return bad
 
     # ---------------- 18.3 停机：单颗失能 / 重新使能到保持 ----------------
@@ -559,8 +606,10 @@ class JointBus:
         if not m.enable():
             return False
         time.sleep(0.1)
-        m.set_mode(MODE_PROFILE_POSITION)
+        # 20.9.1：先写目标=当前位置，再切位置模式，再写一次目标
+        m.set_target_turns(pos_turns)
         self._write_profile(name, c.motion_speed_deg_s)
+        m.set_mode(MODE_PROFILE_POSITION)
         m.set_target_turns(pos_turns)
         self._targets[name] = c.out_deg(pos_turns)
         return True
@@ -585,29 +634,49 @@ class JointBus:
         except Exception:  # noqa: BLE001
             return None
 
-    def hold_all(self) -> dict[str, float]:
-        """把每颗目标改写成它当前的位置，并强制切回 S 曲线位置模式。
+    def hold_all(self) -> dict:
+        """逐颗尽力把目标改写成当前位置，并切回 S 曲线位置模式。
 
-        中止时不能假设电机本来就在位置模式；如果它在电流模式，只写 target
-        不会停住，会继续往限位掉。"""
-        q = {}
+        20.1：不因个别关节读不到/没确认就整体抛异常。返回：
+            {"ok": bool, "held": {name: deg},
+             "unconfirmed": [{"name": n, "reason": r}],
+             "unreadable": [name, ...]}
+        """
+        held: dict[str, float] = {}
+        unconfirmed: list[dict] = []
+        unreadable: list[str] = []
+        seen: set[str] = set()
+
+        def add(name: str, reason: str):
+            if name not in seen:
+                seen.add(name)
+                unconfirmed.append({"name": name, "reason": reason})
+
         with self._lock:
             for name in self.order:
                 m = self.motors[name]
-                pos = m.pos_turns()
+                try:
+                    pos = m.pos_turns(timeout=0.15, retries=2)
+                except Exception:  # noqa: BLE001
+                    pos = None
                 if pos is None:
+                    unreadable.append(name)
+                    add(name, "读不到位置")
                     continue
-                m.set_target_turns(pos)
-                m.set_mode(MODE_PROFILE_POSITION)
-                m.set_target_turns(pos)
-                q[name] = self.cfg[name].out_deg(pos)
-                self._targets[name] = q[name]
-        bad = self.verify_ready()
-        if bad:
-            raise StartupRefused(
-                "中止保持时这些关节没有真正使能/不在位置模式："
-                + "，".join(f"{n}({m})" for n, m in bad))
-        return q
+                try:
+                    m.set_target_turns(pos)
+                    m.set_mode(MODE_PROFILE_POSITION)
+                    m.set_target_turns(pos)
+                except Exception as exc:  # noqa: BLE001
+                    add(name, f"写目标/切模式失败：{exc}")
+                    continue
+                held[name] = self.cfg[name].out_deg(pos)
+                self._targets[name] = held[name]
+        if held:
+            for n, why in self.verify_ready(list(held)):
+                add(n, why)
+        return {"ok": not unconfirmed, "held": held,
+                "unconfirmed": unconfirmed, "unreadable": unreadable}
 
     def stats(self) -> dict:
         return self.link.stats

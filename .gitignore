@@ -6,3 +6,6 @@ __pycache__/
 # 运行时生成
 arm-control/runs/
 runs/
+
+# 停机运行态
+arm-control/config/park_state.json

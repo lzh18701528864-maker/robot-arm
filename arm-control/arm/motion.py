@@ -328,7 +328,8 @@ class Motion:
             pass
         return []
 
-    def plan_park(self, q_from=None, park: dict | None = None) -> dict:
+    def plan_park(self, q_from=None, park: dict | None = None,
+                  include_down: bool = True) -> dict:
         """18.3 停机：抬高 → 收拢+折腕+转 J1 → 预停机点 → P。
 
         返回四段列表；执行器在 pre / park 到达后各停 1 s 读 I₀、I₁。
@@ -341,7 +342,8 @@ class Motion:
         cur = lift[-1]["q_target"] if lift else list(q0)
         tuck = self._plan_move(cur, poses["tuck"], "收拢+折腕+转 J1")
         pre = self._plan_move(poses["tuck"], poses["pre"], "J2/J3 到预停机点")
-        down = self._plan_move(poses["pre"], poses["park"], "下降到 P")
+        down = (self._plan_move(poses["pre"], poses["park"], "下降到 P")
+                if include_down else [])
         return {"lift": lift, "tuck": tuck, "pre": pre, "park": down,
                 "poses": poses}
 
@@ -353,28 +355,50 @@ class Motion:
         return self._plan_move(q0, (pk.get("poses") or {})["pre"], "抬回预停机点")
 
     # ---------------- 执行 ----------------
+    def begin_command(self):
+        """20.3：接受新命令时清停止标志并立即置 busy。
+
+        这样从 /api/execute 返回“已启动”那一刻起，按“停”一定有效，
+        不会掉进“线程还没跑到 execute”的空档。
+        """
+        with self._lock:
+            self._stop.clear()
+            self._stop_reason = "用户按停"
+            self.status.update({
+                "busy": True, "phase": "starting", "reason": "",
+                "started": time.time(), "finished": None, "progress": 0.0,
+            })
+
     def stop(self, reason: str = "用户按停"):
-        if not self.status.get("busy"):
-            with self._lock:
-                self.status["phase"] = "idle"
-                self.status["reason"] = ""
-            return
+        # 20.3/20.7：停止标志无条件置位；不忙时也不能把 aborted/error 洗成 idle
         self._stop.set()
         self._stop_reason = reason
         with self._lock:
-            self.status["phase"] = "stopping"
-            self.status["reason"] = reason
+            if self.status.get("busy"):
+                self.status["phase"] = "stopping"
+                self.status["reason"] = reason
+            elif self.status.get("phase") not in ("aborted", "error"):
+                self.status["phase"] = "idle"
+                self.status["reason"] = ""
 
     def _abort(self, reason: str):
+        """中止 = 原地保持；只有六颗全部读不到（通信完全断）才全部失能。"""
+        res = None
         try:
-            self.bus.hold_all()
+            res = self.bus.hold_all()
         except Exception as exc:  # noqa: BLE001
             reason += f"（保持时通信失败：{exc}）"
-            # 通信已经完全断了：照旧发全部失能（发出去也算尽到责任）
+        unreadable = list((res or {}).get("unreadable") or [])
+        unconfirmed = list((res or {}).get("unconfirmed") or [])
+        if len(unreadable) >= len(self.order):
+            reason += "；六颗都读不到位置（通信完全断），按 16.4 全部失能"
             try:
                 self.bus.disable_all(True, "通信中断")
             except Exception:  # noqa: BLE001
                 pass
+        elif unconfirmed:
+            reason += "；未确认保持：" + "，".join(
+                f"{x.get('name')}({x.get('reason')})" for x in unconfirmed)
         with self._lock:
             self.status["phase"] = "aborted"
             self.status["reason"] = reason
@@ -401,8 +425,8 @@ class Motion:
         timeout = max(5.0, seg["T"] * 1.5 + 3.0)
         last_ok = {n: t0 for n in self.order}
         consec = 0
-        err_ref = None
-        err_ref_t = t0
+        err_ref = {n: None for n in self.order}
+        err_ref_t = {n: t0 for n in self.order}
         while True:
             if self._stop.is_set():
                 self._abort(self._stop_reason)
@@ -411,18 +435,18 @@ class Motion:
                 self.recorder.poll(states)
             now = time.monotonic()
             q = []
-            maxerr = 0.0
+            errs: dict[str, float | None] = {}
             for i, n in enumerate(self.order):
                 st = states[n]
                 if st.out_deg is None:
                     q.append(None)
+                    errs[n] = None
                     if now - last_ok[n] > 0.5:
                         self._abort(f"{n} 0.5 s 没应答")
-                    maxerr = 1e9
                     continue
                 last_ok[n] = now
                 q.append(st.out_deg)
-                maxerr = max(maxerr, abs(st.out_deg - q_target[i]))
+                errs[n] = abs(st.out_deg - q_target[i])
                 lo_s, hi_s = self.bus.cfg[n].safe_limits_deg
                 if st.out_deg < lo_s - 1.0 or st.out_deg > hi_s + 1.0:
                     self._abort(
@@ -431,6 +455,7 @@ class Motion:
                 if st.error:
                     self._abort(f"{n} 报警 0x{st.error:04X} {st.error_text}")
             if None not in q:
+                maxerr = max(errs.values())
                 # 0.8° 以内算到位；J3 这种有摩擦/背隙的关节常停在 0.3~0.5°
                 if maxerr < 0.8:
                     consec += 1
@@ -450,21 +475,26 @@ class Motion:
                                 n, float(q_target[i]), pos_deg=float(q[i]),
                                 error=states[n].error)
                     return
-            # 16.4 第 7 条（P08-4 口径）：>5° 且连续 0.3 s 内误差下降不到 1° → 中止。
-            # 驱动不回插补目标，所以误差对本段终点量；正常 20°/s 每 0.3 s
-            # 约降 6°，不会误触发；停住/倒退/下垂才停。
-            if None not in q and now - t0 > 0.35:
-                if maxerr > 5.0:
-                    if err_ref is None or maxerr <= err_ref - 1.0:
-                        err_ref = maxerr
-                        err_ref_t = now
-                    elif now - err_ref_t > 0.3:
-                        self._abort(
-                            f"实际位置和目标差 {maxerr:.1f}° >5°，"
-                            "且 0.3 s 内下降不到 1°")
-                else:
-                    err_ref = None
-                    err_ref_t = now
+            # 16.4 第 7 条（P08-4 口径）：逐关节判，>5° 且连续 0.3 s 内
+            # 误差下降不到 1° → 中止。数值不动；一颗小关节卡住不会等到
+            # 大关节走完/超时才发现。
+            if now - t0 > 0.35:
+                for n in self.order:
+                    e = errs.get(n)
+                    if e is None:
+                        continue
+                    if e > 5.0:
+                        ref = err_ref.get(n)
+                        if ref is None or e <= ref - 1.0:
+                            err_ref[n] = e
+                            err_ref_t[n] = now
+                        elif now - err_ref_t.get(n, t0) > 0.3:
+                            self._abort(
+                                f"{n} 实际位置和目标差 {e:.1f}° >5°，"
+                                "且 0.3 s 内下降不到 1°")
+                    else:
+                        err_ref[n] = None
+                        err_ref_t[n] = now
             if now - t0 > timeout:
                 self._abort(f"到达超时（{timeout:.1f} s）")
             if None not in q:
@@ -475,10 +505,17 @@ class Motion:
             time.sleep(max(0.0, 1.0 / self.poll_hz - (time.monotonic() - now)))
 
     def execute(self, segments: list[dict], preview: bool = False,
-                pause_between: float = 0.2) -> dict:
-        """执行（或预演）一组已规划好的段。预演绝不写电机。"""
-        self._stop.clear()
-        self._stop_reason = "用户按停"
+                pause_between: float = 0.2, clear_stop: bool = True) -> dict:
+        """执行（或预演）一组已规划好的段。预演绝不写电机。
+
+        clear_stop=False 用于“命令已在接受时 begin_command() 过”，
+        避免把刚按下的停又清掉。
+        """
+        if clear_stop:
+            self._stop.clear()
+            self._stop_reason = "用户按停"
+        elif self._stop.is_set():
+            self._abort(self._stop_reason or "启动前已按停")
         for seg in segments:
             self._check_q(seg["q_target"], seg.get("descend", False))
         with self._lock:
@@ -517,7 +554,12 @@ class Motion:
                 self.status.update({"busy": False, "phase": "error",
                                     "reason": str(exc), "finished": time.time()})
             try:
-                self.bus.hold_all()
+                res = self.bus.hold_all()
+                un = (res or {}).get("unconfirmed") or []
+                if un:
+                    with self._lock:
+                        self.status["reason"] += "；未确认保持：" + "，".join(
+                            f"{x.get('name')}({x.get('reason')})" for x in un)
             except Exception:  # noqa: BLE001
                 pass
             raise

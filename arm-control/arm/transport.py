@@ -100,7 +100,6 @@ class EcbTransport:
         self.rx = 0
         self.tx_fail = 0
         self.timeouts = 0
-        self._buf: list[Frame] = []
         self.last_rx_time: float | None = None
 
     def local_ip(self) -> str:
@@ -140,8 +139,25 @@ class EcbTransport:
             self.rx += len(got)
             self.last_rx_time = time.monotonic()
             frames.extend(got)
-        self._buf.extend(frames)
         return frames
+
+    def _drain_rx(self) -> None:
+        """发新请求前丢掉套接字里已经到的旧包。
+
+        上一次超时请求的迟到回包如果留着，可能被当成这一次同指令的应答。
+        只丢弃，不计入 rx；不保留历史缓冲。
+        """
+        self._sock.setblocking(False)
+        try:
+            while True:
+                try:
+                    self._sock.recvfrom(8192)
+                except (BlockingIOError, InterruptedError):
+                    break
+                except OSError:
+                    break
+        finally:
+            self._sock.setblocking(True)
 
     def request(self, addr: int, cmd: int, data: bytes = b"",
                 timeout: float | None = None, retries: int | None = None) -> Frame | None:
@@ -150,6 +166,7 @@ class EcbTransport:
         raw = make_frame(addr, cmd, data)
         with self._lock:
             for _ in range(max(1, retries)):
+                self._drain_rx()
                 self._send(raw)
                 end = time.monotonic() + timeout
                 while time.monotonic() < end:
@@ -182,15 +199,18 @@ class EcbTransport:
             for _ in range(max(1, retries)):
                 if not pending:
                     break
+                self._drain_rx()
                 for addr, cmd, _n in pending:
                     self._send(make_frame(addr, cmd))
                 want = {(a, c): n for a, c, n in pending}
                 end = time.monotonic() + timeout
-                while time.monotonic() < end and len(results) < len(want):
+                got_round: set[tuple[int, int]] = set()
+                while time.monotonic() < end and len(got_round) < len(want):
                     for f in self._collect(min(0.01, end - time.monotonic())):
                         key = (f.addr, f.cmd)
                         if key in want and len(f.data) >= want[key] and key not in results:
                             results[key] = f.data[:want[key]]
+                            got_round.add(key)
                 pending = [it for it in pending if (it[0], it[1]) not in results]
                 if pending:
                     self.timeouts += len(pending)
@@ -215,6 +235,7 @@ class EcbTransport:
 
     def scan(self, wait: float = 2.0) -> dict[int, int]:
         with self._lock:
+            self._drain_rx()
             self._send(make_frame(0x00, 0x02))
             frames = self._collect(wait)
         out: dict[int, int] = {}

@@ -3,7 +3,7 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 import { TransformControls } from './vendor/TransformControls.js';
 
 // 每次改网页都同时改这里和 web/version.json；刷新后右上角应显示这个版本
-const WEB_VERSION = '2026-11-10.7';
+const WEB_VERSION = '2026-11-13.1';
 const webverEl = document.getElementById('pill-webver');
 if (webverEl) webverEl.textContent = `网页 v${WEB_VERSION}`;
 
@@ -240,6 +240,29 @@ const dot = new THREE.Mesh(new THREE.SphereGeometry(3, 12, 10),
 targetGroup.add(ring, dot, vline);
 targetGroup.visible = false;
 scene.add(targetGroup);
+
+// 20.8：停机实际下降路径（后端给的 TCP 点，橙色虚线）
+const descentMat = new THREE.LineDashedMaterial({
+  color: 0xffb14e, dashSize: 10, gapSize: 6, transparent: true, opacity: 0.85,
+});
+const descentLine = new THREE.Line(new THREE.BufferGeometry(), descentMat);
+descentLine.visible = false;
+scene.add(descentLine);
+let _descentKey = '';
+function setDescentPath(points) {
+  if (!points || points.length < 2) {
+    descentLine.visible = false; _descentKey = ''; return;
+  }
+  const key = JSON.stringify(points);
+  if (key === _descentKey) { descentLine.visible = true; return; }
+  _descentKey = key;
+  const g = new THREE.BufferGeometry().setFromPoints(
+    points.map((p) => new THREE.Vector3(p[0], p[1], p[2])));
+  descentLine.geometry.dispose();
+  descentLine.geometry = g;
+  descentLine.computeLineDistances();
+  descentLine.visible = true;
+}
 
 let _markerKey = '';
 function setTargetMarker(t) {
@@ -565,6 +588,7 @@ async function tryAcquire() {
   try {
     const r = await postRaw('/api/acquire', {
       client_id: CLIENT_ID, config_version: CONFIG_VERSION,
+      ...(TOKEN ? { token: TOKEN } : {}),
     });
     TOKEN = r.token;
     READONLY = false;
@@ -580,6 +604,7 @@ async function tryAcquire() {
         try {
           const r = await postRaw('/api/acquire', {
             client_id: CLIENT_ID, config_version: CONFIG_VERSION,
+            ...(TOKEN ? { token: TOKEN } : {}),
           });
           TOKEN = r.token; READONLY = false;
           clearInterval(acquireTimer); acquireTimer = null;
@@ -632,7 +657,8 @@ function syncVersion(s) {
     CONFIG_VERSION = s.config_version;
     log('配置版本已更新（校准时会改配置），重新拿控制权', 'w');
     if (TOKEN) {
-      postRaw('/api/acquire', { client_id: CLIENT_ID, config_version: CONFIG_VERSION })
+      postRaw('/api/acquire', { client_id: CLIENT_ID, config_version: CONFIG_VERSION,
+        ...(TOKEN ? { token: TOKEN } : {}) })
         .then((r) => { TOKEN = r.token; })
         .catch((e) => log('重新拿控制权失败：' + e.message, 'w'));
     }
@@ -656,8 +682,10 @@ function applyState(s) {
     if (s.preview && s.preview.scene) {
       preview.setScene(s.preview.scene);
       setTargetMarker(s.preview.target || s.preview.tcp);
+      setDescentPath(s.preview.park && s.preview.park.descent_path);
     } else {
       preview.group.visible = false;
+      setDescentPath(null);
     }
     if (!s.preview) setTargetMarker(null);
   }
@@ -804,7 +832,8 @@ function updateUI(s) {
   if (owner) { pill.textContent = '控制权 你'; pill.className = 'pill on'; }
   else if (c.owner) { pill.textContent = `控制权 ${c.owner}`; pill.className = 'pill'; }
   else { pill.textContent = '控制权 无'; pill.className = 'pill'; }
-  $('hdr-msg').textContent = s.msg || '';
+  $('hdr-msg').textContent = (s.msg || '') +
+    (s.config_stale ? ' · 配置已变，请重新连接' : '');
   $('foot-right').textContent = s.recorder ? `CSV: ${s.recorder}` : '';
   const tcpSel = $('tcp-preset');
   if (tcpSel && s.tcp_preset && tcpSel.value !== s.tcp_preset) tcpSel.value = s.tcp_preset;
@@ -813,13 +842,14 @@ function updateUI(s) {
 
   const busy = s.motion && s.motion.busy;
   const dragActive = !!(s.drag && s.drag.active);
-  $('btn-enable').disabled = !s.connected || !owner || s.startup_done || busy || dragActive;
-  $('btn-reenable').disabled = !s.connected || !owner || busy || dragActive || unsafe;
+  const stale = !!s.config_stale;
+  $('btn-enable').disabled = !s.connected || !owner || s.startup_done || busy || dragActive || stale;
+  $('btn-reenable').disabled = !s.connected || !owner || busy || dragActive || unsafe || stale;
   $('btn-clear-errors').disabled = !s.connected || !owner || busy || dragActive;
   $('btn-park').disabled = !s.connected || !owner || busy || dragActive || unsafe ||
-    s.end_effector !== 'flange';
+    stale || s.end_effector !== 'flange';
   $('btn-park-teach').disabled = !s.connected || !owner || busy || dragActive || unsafe ||
-    !s.startup_done || s.end_effector !== 'flange';
+    stale || !s.startup_done || s.end_effector !== 'flange';
   const pblk = (s.park && s.park.block) || null;
   const blkEl = $('park-block');
   const ackBtn = $('btn-park-ack');
@@ -836,9 +866,9 @@ function updateUI(s) {
     ackBtn.style.display = pblk ? 'block' : 'none';
     ackBtn.disabled = !owner;
   }
-  $('btn-recover').disabled = !s.connected || !owner || busy || dragActive || unsafe;
-  $('btn-unpark').disabled = !s.connected || !owner || busy || dragActive || unsafe;
-  $('btn-support-park').disabled = !s.connected || !owner || busy || dragActive || unsafe;
+  $('btn-recover').disabled = !s.connected || !owner || busy || dragActive || unsafe || stale;
+  $('btn-unpark').disabled = !s.connected || !owner || busy || dragActive || unsafe || stale;
+  $('btn-support-park').disabled = !s.connected || !owner || busy || dragActive || unsafe || stale;
   // 紧急失能故意不检查 unsafe；只要连接/控制权/不在运动/不在拖动
   $('btn-disable-all').disabled = !s.connected || !owner || busy || dragActive;
   $('btn-ee').disabled = !owner || busy || dragActive;
@@ -854,7 +884,7 @@ function updateUI(s) {
     if (other) roNote.textContent = `只读：控制权在 ${other}（另一个页面还在心跳）。关掉其他机器人页面，或点“重新取得控制权”。`;
   }
   $('btn-acquire').disabled = !s.connected || owner || busy || dragActive;
-  $('btn-exec').disabled = !s.has_plan || busy || !owner || unsafe;
+  $('btn-exec').disabled = !s.has_plan || busy || !owner || unsafe || stale;
   $('btn-stop').disabled = !s.connected && !busy;
   const ps = document.getElementById('plan-state');
   if (ps) {
@@ -863,8 +893,8 @@ function updateUI(s) {
     else ps.textContent = '还没有计划：拖到可达点或点网格。';
     ps.style.color = s.has_plan && owner ? '#6bffb0' : '#8a9bb0';
   }
-  $('btn-home').disabled = busy || !owner || unsafe;
-  $('btn-home-plan').disabled = !s.connected || !owner || busy || unsafe || !s.startup_done;
+  $('btn-home').disabled = busy || !owner || unsafe || stale;
+  $('btn-home-plan').disabled = !s.connected || !owner || busy || unsafe || !s.startup_done || stale;
   $('mode-preview').disabled = !owner;
   $('mode-direct').disabled = !owner || !s.connected;
   document.querySelectorAll('#jog button').forEach((b) => { b.disabled = !owner || unsafe; });
@@ -913,13 +943,20 @@ function updateUI(s) {
   const eeSel = $('ee');
   if (eeSel && s.end_effector && eeSel.value !== s.end_effector) eeSel.value = s.end_effector;
   const caps = s.capacities || {};
+  const lused = s.limits_used || {};
   const capTxt = ['J2', 'J3', 'J4', 'J5']
     .map((k) => `${k} ${caps[k] === null || caps[k] === undefined ? '—' : caps[k].toFixed(2)}`)
     .join('  ');
+  const srcTxt = ['J2', 'J3', 'J4', 'J5'].map((k) => {
+    if (k === 'J3') return 'J3 固定6.50';
+    const x = lused[k] || {};
+    return `${k} ${x.a === null || x.a === undefined ? '—' : Number(x.a).toFixed(2) + 'A'} ${x.source || '—'}`;
+  }).join('  ');
   if ($('ee-info')) $('ee-info').innerHTML = kv([
     ['末端', s.end_effector || '—'],
     ['载荷 kg', fmt(s.payload_kg, 2)],
     ['容量 N·m', capTxt],
+    ['限流来源', srcTxt],
   ]);
   const hold = s.hold || {};
   if ($('torque-info')) $('torque-info').innerHTML = kv([
@@ -940,6 +977,7 @@ function updateUI(s) {
       : `z ${fmt(pstep.z, 1)} mm · 第 ${pstep.step || 0} 步`, pstep.phase === 'catch_failed' ? 'bad' : ''],
     ['当前 J2', pstep.I2 === null || pstep.I2 === undefined ? '—' : `${fmt(pstep.I2, 2)} A`],
     ['搁架 side', park.park_side],
+    ['实际下降', (park.descent && park.descent.note) || '—'],
     ['教过 P', park.park_taught ? `是 · ${park.park_taught_at || ''}` : '否',
       park.park_taught ? 'ok' : ''],
     ['parked_q', pchk.has_parked ? (pchk.ok ? '一致（在搁架上）' : `差 ${pchk.max_diff_deg}°`)
@@ -1142,6 +1180,8 @@ $('btn-park').addEventListener('click', async () => {
     log('停机：生成预演 ...', 'w');
     const p = await apiPost('/api/park', { preview: true, prereq });
     (p.segments || []).forEach((s) => log(`  ${s.label}  T=${s.T}s`));
+    if (p.preview && p.preview.park && p.preview.park.note) log(p.preview.park.note, 'w');
+    if (p.descent && p.descent.note) log('下降路径：' + p.descent.note, 'w');
     if (!confirm('停机预演已生成（见日志）。执行停机？\n\n抬高 → 收拢+折腕+转 J1 → 预停机点（读 I₀）\n→ 下降到 P（读 I₁）→ 搁架接住判定 → 按 J6→J1 失能。\n\n全程人不碰臂。')) return;
     await apiPost('/api/park', { preview: false, prereq });
     log('停机流程已启动', 'w');

@@ -118,8 +118,17 @@ class Executor:
         self._poll_stop = threading.Event()
         self._poll_thread = None
         self._exec_thread = None
+        self._exec_lock = threading.Lock()
         self._last_full = 0.0
         self._last_states = {}
+
+        # 20.3：停机线程自己的停止标志；park_active 覆盖整个停机流程
+        self._park_stop = threading.Event()
+        self.park_active = False
+
+        # 20.6：配置热重载（方案 B：连接期间配置变了就拒绝运动/使能，直到重连）
+        self.config_stale = False
+        self.config_stale_msg = ""
 
         # 控制权 / 心跳
         self.owner: str | None = None
@@ -164,11 +173,42 @@ class Executor:
         q = Path(p)
         return q if q.is_absolute() else (cfgmod.ROOT / q)
 
-    def refresh_config_version(self):
-        self.config_version = cfgmod.config_version()
-        self.config_info = cfgmod.config_versions()
+    def refresh_config_version(self, force: bool = False):
+        new_version = cfgmod.config_version()
         self.web_version = self._read_web_version()
+        if new_version == self.config_version and not force:
+            return
+        self.config_version = new_version
+        self.config_info = cfgmod.config_versions()
+        # 20.6 方案 B：连接期间配置变了，不偷偷换一半派生量；
+        # 拒绝使能/运动，直到重新 connect。断开时 refresh 才全量重载。
+        if self.bus is not None and not force:
+            self.config_stale = True
+            self.config_stale_msg = (
+                "配置已变（joints/tcp/URDF），请重新连接后再使能/运动")
+            return
+        self.config_stale = False
+        self.config_stale_msg = ""
         self.joint_cfg = load_joint_configs()
+        self.limits = (
+            [self.joint_cfg[n].safe_limits_deg[0] for n in self.robot.joint_names],
+            [self.joint_cfg[n].safe_limits_deg[1] for n in self.robot.joint_names],
+        )
+        # URDF 也可能变了：重连时整条链重建，Fence/预演一起换
+        ws = getattr(self.fence, "workspace", None)
+        self.robot = RobotModel(cfgmod.URDF, cfgmod.tcp_presets())
+        self.fence = Fence(self.robot, workspace=ws)
+        self.preview_bus = VirtualJointBus(self.joint_cfg)
+        self.preview_motion.bus = self.preview_bus
+        self.preview_motion.robot = self.robot
+        self.preview_motion.fence = self.fence
+        self.preview_motion.limits = (list(self.limits[0]), list(self.limits[1]))
+        self.j2_bracket = str(getattr(self.joint_cfg.get("J2"), "j2_bracket", "PLA"))
+        self.cache = {}
+        self.preview = None
+        self.pending = None
+        self._home_preview = None
+        self._sync_motion_params()
 
     def use_actual(self) -> bool:
         return bool(self.connected and self.motion is not None
@@ -212,11 +252,10 @@ class Executor:
     def touch(self, client_id: str | None):
         if not client_id:
             return
+        # 20.4：touch 只说明“这个客户端还连着”，不刷新控制权心跳
         self.clients[client_id] = time.monotonic()
-        if self.owner == client_id:
-            self.last_hb = time.monotonic()
 
-    def acquire(self, client_id: str, version: str) -> dict:
+    def acquire(self, client_id: str, version: str, token: str | None = None) -> dict:
         if not client_id:
             raise AuthError("缺 client_id")
         if version != self.config_version:
@@ -224,12 +263,14 @@ class Executor:
                             "拒绝一切运动命令，请刷新/重新拉配置")
         now = time.monotonic()
         if self.owner and self.owner != client_id:
-            age = now - max(self.last_hb, self.clients.get(self.owner, 0.0))
+            age = now - self.last_hb
             if age < self.control_stale:
                 raise AuthError(f"控制权在 {self.owner} 手里（{age:.1f}s 前还有心跳）")
         if self.owner == client_id and self.token:
-            # 同一个客户端重复 acquire（页面轮询和初始化撞车）：返回原 token，
-            # 不要换新 token，否则前一个请求会突然失效
+            # 20.9.5：同一个 client_id 重复 acquire 必须带原 token；
+            # 光知道 client_id（/api/state 里公开）不能拿走控制权。
+            if token != self.token:
+                raise AuthError("client_id 已被占用；重复 acquire 必须带原 token")
             self.last_hb = now
             self.clients[client_id] = now
             return {"token": self.token, "client_id": client_id,
@@ -269,10 +310,39 @@ class Executor:
         self.clients[self.owner] = self.last_hb
         return {"ok": True, "owner": self.owner}
 
+    def is_busy(self) -> bool:
+        """20.3：停机线程活着的整段时间都算忙，普通执行线程也算。"""
+        if self.park_active:
+            return True
+        if self._park_thread and self._park_thread.is_alive():
+            return True
+        if self._exec_thread and self._exec_thread.is_alive():
+            return True
+        return bool(self.motion and self.motion.status.get("busy"))
+
+    def stop_all(self, reason: str = "用户按停", quiet: bool = False) -> dict:
+        """20.3：统一的停；停机线程、校准、拖动、普通运动都收到。"""
+        self._park_stop.set()
+        if self.calib.active:
+            try:
+                self.calib.abort(reason=reason)
+            except Exception:  # noqa: BLE001
+                pass
+        elif self.drag_active:
+            try:
+                self.drag_stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if self.motion:
+            self.motion.stop(reason)
+        if not quiet:
+            self.msg = f"已按停：{reason}"
+        return {"ok": True}
+
     def release(self, token: str) -> dict:
         if self.token and token == self.token:
-            if self.motion and self.motion.status.get("busy"):
-                self.motion.stop("控制权释放")
+            if self.is_busy():
+                self.stop_all("控制权释放", quiet=True)
             self.owner = None
             self.token = None
             self.msg = "控制权已释放"
@@ -282,10 +352,10 @@ class Executor:
         while not self._watch_stop.is_set():
             try:
                 now = time.monotonic()
+                hb = self.last_hb if self.owner else 0.0
                 if self.calib.active:
                     # 校准会话：没有控制方、或心跳断了 >0.5 s，就结束并失能。
                     # 正在执行长命令（设零/点动等）时不打断，操作自己会检查。
-                    hb = self.last_hb if self.owner else 0.0
                     if (not self.calib.busy) and ((not self.owner) or now - hb > self.hb_timeout):
                         age = (now - hb) if self.owner else 999.0
                         reason = (f"控制方心跳断了 {age:.2f}s"
@@ -293,17 +363,16 @@ class Executor:
                         self.calib.abort(reason=reason)
                         self.msg = reason
                 elif self.drag_active and (
-                        (not self.owner) or now - max(self.last_hb, 0.0) > self.hb_timeout):
+                        (not self.owner) or now - hb > self.hb_timeout):
                     self.drag_stop()
                     self.msg = "拖动时控制方心跳断了，已切回位置保持"
                 elif self.owner:
-                    hb = max(self.last_hb, self.clients.get(self.owner, 0.0))
-                    busy = bool(self.motion and self.motion.status.get("busy"))
+                    busy = self.is_busy()
                     if busy and now - hb > self.hb_timeout:
                         reason = (f"控制方心跳断了 {now-hb:.2f}s"
                                   f"（>{self.hb_timeout}s），已按中止处理：原地保持")
                         self.msg = reason
-                        self.motion.stop(reason)
+                        self.stop_all(reason, quiet=True)
                     elif not busy and now - hb > self.control_stale:
                         self.owner = None
                         self.token = None
@@ -318,7 +387,9 @@ class Executor:
         if self.calib.active:
             raise MotionError("校准会话进行中，先结束校准")
         self.disconnect()
-        self.refresh_config_version()
+        self.refresh_config_version(force=True)
+        self.config_stale = False
+        self.config_stale_msg = ""
         ip = ip or self.ecb_ip
         port = int(port or self.ecb_port)
         if mode == "mock":
@@ -354,6 +425,14 @@ class Executor:
                 "msg": self.msg, "config_version": self.config_version}
 
     def disconnect(self):
+        self._park_stop.set()
+        if self.motion:
+            self.motion.stop("断开连接")
+        if self._park_thread and self._park_thread.is_alive():
+            self._park_thread.join(timeout=2.0)
+        if self._exec_thread and self._exec_thread.is_alive() and self.motion:
+            self.motion.stop("断开连接")
+            self._exec_thread.join(timeout=1.0)
         if self.bus:
             try:
                 if getattr(self.bus, "startup_done", False):
@@ -370,6 +449,8 @@ class Executor:
         self.motion = None
         self.connected = False
         self.mode = None
+        self.config_stale = False
+        self.config_stale_msg = ""
         self.cache = {}
         self.preview = None
         self.pending = None
@@ -386,10 +467,10 @@ class Executor:
                 now = t0
                 if now - last_cfg_check > 1.0:
                     last_cfg_check = now
-                    busy = bool(self.motion and self.motion.status.get("busy"))
-                    if not busy and cfgmod.config_version() != self.config_version:
+                    if cfgmod.config_version() != self.config_version:
                         self.refresh_config_version()
-                        self.msg = "配置已更新（sign/零位/限位），已热重载"
+                        self.msg = (self.config_stale_msg
+                                    or "配置已更新（sign/零位/限位），已热重载")
                 self._refresh()
             except Exception as exc:  # noqa: BLE001
                 self.msg = f"轮询异常：{exc}"
@@ -543,11 +624,13 @@ class Executor:
             "kt": {"rows": self.kt_rows, "kt": self.kt},
             "control": {
                 "owner": self.owner,
-                "age_s": None if not self.owner else round(
-                    now - max(self.last_hb, self.clients.get(self.owner, 0.0)), 2),
+                "age_s": None if not self.owner else round(now - self.last_hb, 2),
                 "stale_s": self.control_stale,
                 "timeout_s": self.hb_timeout,
             },
+            "config_stale": bool(self.config_stale),
+            "config_stale_msg": self.config_stale_msg,
+            "limits_used": self.limit_used(),
         }
 
     def calibrated(self) -> tuple[bool, list[str]]:
@@ -559,6 +642,10 @@ class Executor:
 
     # ---------------- 规划 ----------------
     def _ready_for_motion(self, allow_hold: bool = False):
+        if self.park_active or (self._park_thread and self._park_thread.is_alive()):
+            raise MotionError("停机流程正在跑：先按停，等它停在保持状态")
+        if self.config_stale:
+            raise MotionError(self.config_stale_msg or "配置已变，请重新连接")
         if self.drag_active:
             raise MotionError("零扭矩拖动中，先“锁定保持”再执行")
         if self.calib.active:
@@ -577,6 +664,10 @@ class Executor:
         ok, missing = self.calibrated()
         if not ok:
             raise MotionError("还没完成设零/方向核对：缺 " + ", ".join(missing))
+
+    def _reject_if_parking(self):
+        if self.park_active or (self._park_thread and self._park_thread.is_alive()):
+            raise MotionError("停机流程正在跑：先按停，等它停在保持状态")
 
     # ---------------- 18.1 / 18.2 搁架、末端配置、力矩 ----------------
     def park_config(self) -> dict:
@@ -604,18 +695,47 @@ class Executor:
                 q[0] = q1
             poses[key] = q
         pk["poses"] = poses
+        z_min = float(pk.get("descent_min_j4_z") or 130.5)
+        step = float(pk.get("descent_step_mm") or 1.0)
+        pk["descent"] = {
+            "start_z": 168.0, "min_z": z_min, "step_mm": step,
+            "note": ("教的点目前只决定左右侧；实际下降按固定公式从 z=168 到 "
+                     f"{z_min:.1f}，每 {step:g} mm 一步"),
+        }
         return pk
 
     def current_limits(self) -> dict:
-        """回读限流（A）；没有回读值时退回配置里的要求值。"""
+        """20.5：优先用总线真正回读的限流；J2 读不到时按最保守 3.0 A。
+
+        不再从状态缓存里拿（read_all 的 0x59 未读时会拿配置值冒充）。
+        """
+        readbacks = getattr(self.bus, "current_limit_readback", {}) if self.bus else {}
         out = {}
-        states = self.cache.get("states") or {}
         for n in self.robot.joint_names:
-            st = states.get(n)
-            v = getattr(st, "current_limit_a", None) if st is not None else None
+            v = readbacks.get(n)
             if v is None:
-                v = getattr(self.joint_cfg.get(n), "required_current_limit_a", None)
+                if n == "J2":
+                    v = 3.0          # 最保守；网页会标“未回读”
+                else:
+                    v = getattr(self.joint_cfg.get(n),
+                                "required_current_limit_a", None)
             out[n] = None if v is None else float(v)
+        return out
+
+    def limit_used(self) -> dict:
+        """给网页看：每个关节用的是回读值、配置值还是固定容量。"""
+        readbacks = getattr(self.bus, "current_limit_readback", {}) if self.bus else {}
+        out = {}
+        for n in self.robot.joint_names:
+            v = readbacks.get(n)
+            if v is not None:
+                out[n] = {"a": round(float(v), 3), "source": "回读"}
+            elif n == "J2":
+                out[n] = {"a": 3.0, "source": "保守(未回读)"}
+            elif n in ("J4", "J5"):
+                out[n] = {"a": None, "source": "固定容量2.30"}
+            else:
+                out[n] = {"a": None, "source": "固定"}
         return out
 
     def _sync_motion_params(self):
@@ -637,12 +757,17 @@ class Executor:
                 for k, v in cap.items()}
 
     def set_end_effector(self, end_effector: str, payload_kg=None) -> dict:
+        self._reject_if_parking()
         ee = str(end_effector or "")
         if ee not in gravity.END_EFFECTORS:
             raise MotionError("末端只能是 " + " / ".join(gravity.END_EFFECTORS))
         if payload_kg is not None:
             self.payload_kg = max(0.0, float(payload_kg))
         self.end_effector = ee
+        # 20.9.4：旧计划的中间点按旧末端查过，换末端后必须清掉
+        self.pending = None
+        self.preview = None
+        self._home_preview = None
         self._sync_motion_params()
         warn = ""
         if ee == "gripper":
@@ -700,6 +825,7 @@ class Executor:
 
     def plan_click(self, x: float, y: float, z: float = 20.0,
                    yaw: float | None = None) -> dict:
+        self._reject_if_parking()
         m = self.planning_motion()
         if m.status.get("busy"):
             raise MotionError("正在运动，点击已忽略")
@@ -728,6 +854,7 @@ class Executor:
 
     def click(self, x: float, y: float, z: float = 20.0,
               yaw: float | None = None) -> dict:
+        self._reject_if_parking()
         r = self.plan_click(x, y, z, yaw)
         if self.exec_mode == "direct":
             self._ready_for_motion()
@@ -741,6 +868,7 @@ class Executor:
         return r
 
     def execute(self, preview: bool | None = None, use_pending: bool = True) -> dict:
+        self._reject_if_parking()
         # 默认按预演处理，避免漏传 preview 时直接动电机
         preview = True if preview is None else bool(preview)
         segs = self.pending if use_pending and self.pending else None
@@ -756,8 +884,6 @@ class Executor:
 
     def _start_exec(self, segments, preview: bool, what: str,
                     motion: Motion | None = None):
-        if self._exec_thread and self._exec_thread.is_alive():
-            raise MotionError("已经在执行")
         m = motion or self.motion
         if m is None:
             raise MotionError("还没连接，不能执行")
@@ -775,17 +901,37 @@ class Executor:
                     q0 = segments[0].get("q_from") if segments else None
                     if q0 is not None and max(abs(a - b) for a, b in zip(qnow, q0)) > 3.0:
                         raise MotionError("当前姿态和预演时不一致，请重新预演后再执行")
-                m.execute(segments, preview=preview)
+                # 20.3：停止标志已在接受命令时 begin_command() 清过，
+                # 这里不能再清，否则 10 ms 内按的停会丢。
+                m.execute(segments, preview=preview, clear_stop=False)
             except MotionError as exc:
+                with m._lock:
+                    if m.status.get("busy"):
+                        m.status.update({"busy": False, "phase": "aborted",
+                                         "reason": str(exc)})
                 self.msg = f"{what}中止：{exc}"
             except Exception as exc:  # noqa: BLE001
+                with m._lock:
+                    if m.status.get("busy"):
+                        m.status.update({"busy": False, "phase": "error",
+                                         "reason": str(exc)})
                 self.msg = f"{what}失败：{exc}"
                 traceback.print_exc()
-        self._exec_thread = threading.Thread(target=worker, daemon=True)
-        self._exec_thread.start()
+
+        with self._exec_lock:
+            if self.park_active or (self._park_thread and self._park_thread.is_alive()):
+                raise MotionError("停机流程正在跑：先按停，等它结束")
+            if self._exec_thread and self._exec_thread.is_alive():
+                raise MotionError("已经在执行")
+            if m.status.get("busy"):
+                raise MotionError("正在运动")
+            m.begin_command()          # 接受命令即 busy，按停立刻有效
+            self._exec_thread = threading.Thread(target=worker, daemon=True)
+            self._exec_thread.start()
         return {"ok": True, "started": True, "preview": preview}
 
     def jog(self, joint: str, delta: float, preview: bool = False) -> dict:
+        self._reject_if_parking()
         if not preview:
             self._ready_for_motion()
             m = self.motion
@@ -810,6 +956,7 @@ class Executor:
         return self._start_exec(segs, False, f"点动 {joint}", motion=self.motion)
 
     def home(self, preview: bool = False) -> dict:
+        self._reject_if_parking()
         if not preview:
             self._ready_for_motion()
             m = self.motion
@@ -841,6 +988,7 @@ class Executor:
         return self._start_exec(segs, False, "回零", motion=self.motion)
 
     def move_joints(self, q, preview: bool = False, descend: bool = False) -> dict:
+        self._reject_if_parking()
         if not preview:
             self._ready_for_motion()
             m = self.motion
@@ -862,6 +1010,7 @@ class Executor:
     def move_tcp(self, target, axis=(0, 0, -1), yaw=None, preview: bool = False,
                  descend: bool = False, preset: str | None = None,
                  free_yaw: bool = False) -> dict:
+        self._reject_if_parking()
         if not preview:
             self._ready_for_motion()
             m = self.motion
@@ -891,6 +1040,7 @@ class Executor:
 
     def move_through(self, waypoints, descend_flags=None, labels=None,
                      preview: bool = False) -> dict:
+        self._reject_if_parking()
         if not preview:
             self._ready_for_motion()
             m = self.motion
@@ -908,10 +1058,12 @@ class Executor:
         return self._start_exec(segs, False, "move_through", motion=self.motion)
 
     # ---------------- 18.3 停机 / 从停机启动 ----------------
-    def _sample_currents(self, names, n=None) -> dict:
+    def _sample_currents(self, names, n=None, stop_event=None) -> dict:
         n = int(n or self.park_cfg.get("sample_n") or 20)
         acc = {k: [] for k in names}
         for _ in range(n):
+            if stop_event is not None and stop_event.is_set():
+                break
             st = self.bus.read_all(full=True)
             for k in names:
                 v = getattr(st.get(k), "current_a", None)
@@ -920,7 +1072,14 @@ class Executor:
             time.sleep(0.02)
         return {k: (round(sum(v) / len(v), 4) if v else None) for k, v in acc.items()}
 
+    def _park_q_at_z(self, z: float, q1: float) -> list[float]:
+        """实际分步下降用的固定公式（20.8：预演和实际共用）。"""
+        c = max(-1.0, min(1.0, (z - 120.5) / 203.5))
+        q2 = math.degrees(math.acos(c))
+        return [q1, q2, 90.0 - q2, 90.0, 0.0, 0.0]
+
     def park(self, preview: bool = False, prereq: dict | None = None) -> dict:
+        self._reject_if_parking()
         m = self.planning_motion()
         if m.status.get("busy"):
             raise MotionError("正在运动，先按停")
@@ -944,25 +1103,50 @@ class Executor:
             raise MotionError("停机前提没勾选：" + "、".join(missing))
         pk = self.park_config()
         q0 = m.read_q()
-        plan = m.plan_park(q0, pk)
+        # 20.8：名义 P 只用于旧画面；实际下降走固定公式，先不规划名义 P
+        # （旧教的 P 可能离地 19.8 mm，围栏会拒绝，不能因此挡住预演）
+        plan = m.plan_park(q0, pk, include_down=False)
         segs = plan["lift"] + plan["tuck"] + plan["pre"]
         self.pending = segs
-        last = plan["park"][-1] if plan["park"] else segs[-1]
-        self.preview = preview_payload(last, self.robot, self.fence,
+        # 20.8：预演画“实际会走”的下降终点，而不是名义 P。
+        # 实际下降用 _park_q_at_z() 从 z=168 起每 1 mm 一步，最低到 130.5。
+        z_min = float(self.park_cfg.get("descent_min_j4_z") or 130.5)
+        q1 = float((pk.get("poses") or {}).get("pre", [90.0])[0])
+        q_end = self._park_q_at_z(z_min, q1)
+        fr = self.fence.check(q_end, self.tcp_preset, self.yaw_deg, False, self.limits)
+        pseudo = {"label": "分步下降到最低点（实际）", "q_target": q_end,
+                  "T": 30.0, "fence": fr.as_dict(), "near_limit": fr.near_limit}
+        self.preview = preview_payload(pseudo, self.robot, self.fence,
                                        self.tcp_preset, self.yaw_deg)
         self.preview["offline"] = not self.use_actual()
+        note = ("教的点目前只决定左右侧；实际下降按固定公式从 z=168 到 "
+                f"{z_min:.1f}，每 {float(self.park_cfg.get('descent_step_mm') or 1.0):g} mm 一步")
+        # 20.8：给网页画一条实际会走的下降路径（TCP 点，z 每 4 mm 一个）
+        path = []
+        zz = 168.0
+        while zz > z_min + 1e-6:
+            qq = self._park_q_at_z(zz, q1)
+            path.append([round(float(v), 2) for v in
+                         self.robot.tcp(qq, self.tcp_preset, self.yaw_deg)[:3, 3]])
+            zz -= 4.0
+        path.append([round(float(v), 2) for v in
+                     self.robot.tcp(q_end, self.tcp_preset, self.yaw_deg)[:3, 3]])
         self.preview["park"] = {"poses": pk["poses"], "shelf": pk["shelf"],
-                                "note": "P 只是名义点；实际按 1 mm 分步下降找接触（18.3 第 4 步）"}
+                                "note": note, "descent_path": path}
         if preview:
             return {"ok": True, "preview": self.preview,
                     "segments": brief_segments(segs + plan["park"]), "started": False,
+                    "descent": {"start_z": 168.0, "min_z": z_min,
+                                "q_min": [round(float(v), 3) for v in q_end],
+                                "note": note},
                     "phases": {"lift": len(plan["lift"]), "tuck": len(plan["tuck"]),
-                               "pre": len(plan["pre"]), "descent": "1 mm/步，最多到 z=130.5"}}
+                               "pre": len(plan["pre"]), "descent": note}}
         self._start_park(plan)
         return {"ok": True, "started": True, "msg": "停机流程已启动（到预停机点后分步下降）"}
 
     def teach_park(self) -> dict:
         """把当前实际六关节位置记录为搁架停机位置（只记录，不运动）。"""
+        self._reject_if_parking()
         if self.end_effector != "flange":
             raise MotionError("当前不是空法兰：停机只对 flange 开放，先切回 flange 再教")
         if not self.connected or not getattr(self.bus, "startup_done", False):
@@ -994,7 +1178,7 @@ class Executor:
             pk["version"] = "2026-11-12.1"
         cfgmod.save_park(pk)
         self.park_cfg = pk
-        self.msg = ("停机位置已记录："
+        self.msg = ("停机位置已记录（教的点目前只决定左右侧；实际下降按固定公式）："
                     + " ".join(f"{n}{v:+.1f}" for n, v in zip(self.robot.joint_names, q)))
         return {"ok": True, "q": [round(float(v), 4) for v in q],
                 "park_side": int(pk["park_side"]),
@@ -1009,13 +1193,24 @@ class Executor:
         return {"ok": True, "msg": self.msg}
 
     def _start_park(self, plan: dict):
-        if self._park_thread and self._park_thread.is_alive():
+        if self.park_active or (self._park_thread and self._park_thread.is_alive()):
             raise MotionError("停机流程已经在跑")
-        self.park_step = {"phase": "moving_pre", "reason": "", "z": None, "step": 0,
-                          "I0": None, "I2": None, "I1": None, "contact_z": None}
+        m = self.motion
+        if m is None:
+            raise MotionError("还没连接")
+        with self._exec_lock:
+            if self._exec_thread and self._exec_thread.is_alive():
+                raise MotionError("已经在执行别的运动")
+            if m.status.get("busy"):
+                raise MotionError("正在运动")
+            self._park_stop.clear()
+            self.park_active = True
+            self.park_step = {"phase": "moving_pre", "reason": "", "z": None, "step": 0,
+                              "I0": None, "I2": None, "I1": None, "contact_z": None,
+                              "disabled": []}
+            m.begin_command()      # 整个停机流程一开始就可以被“停”打断
 
         def worker():
-            m = self.motion
             gap = float(self.park_cfg.get("disable_gap_s") or 0.5)
             settle = float(self.park_cfg.get("settle_s") or 1.0)
             tol = float(self.park_cfg.get("disable_check_deg") or 1.0)
@@ -1024,17 +1219,62 @@ class Executor:
             z_min = float(self.park_cfg.get("descent_min_j4_z") or 130.5)
             q1 = list(plan["poses"]["pre"])[0]
             pre_q = list(plan["poses"]["pre"])
+            disabled: list[str] = []
 
-            def q_at_j4z(z: float) -> list[float]:
-                c = max(-1.0, min(1.0, (z - 120.5) / 203.5))
-                q2 = math.degrees(math.acos(c))
-                return [q1, q2, 90.0 - q2, 90.0, 0.0, 0.0]
+            class _ParkStop(Exception):
+                pass
+
+            def stopped() -> bool:
+                return self._park_stop.is_set()
+
+            def best_hold():
+                try:
+                    return self.bus.hold_all()
+                except Exception:  # noqa: BLE001
+                    return None
+
+            def check_stop():
+                if stopped():
+                    raise _ParkStop()
+
+            def hold_after_stop(why: str):
+                res = None
+                try:
+                    res = self.bus.hold_all()
+                except Exception:  # noqa: BLE001
+                    pass
+                un = (res or {}).get("unconfirmed") or []
+                self.park_step.update({
+                    "phase": "aborted", "reason": why,
+                    "disabled": list(disabled),
+                })
+                tail = ""
+                if disabled:
+                    tail = "；已失能：" + "、".join(disabled)
+                if un:
+                    tail += "；保持未确认：" + "，".join(
+                        f"{x.get('name')}({x.get('reason')})" for x in un)
+                with m._lock:
+                    m.status.update({"busy": False, "phase": "aborted",
+                                     "reason": why})
+                self.msg = f"停机已停在原地（{why}）{tail}"
+                # 已经失能过任何一颗，启动态就不再成立
+                if disabled:
+                    try:
+                        self.bus.startup_done = False
+                    except Exception:  # noqa: BLE001
+                        pass
 
             try:
                 # 1–3：抬高、收拢、到预停机点，读 I₀
-                m.execute(plan["lift"] + plan["tuck"] + plan["pre"], preview=False)
-                time.sleep(settle)
-                i0 = self._sample_currents(["J2", "J3"])
+                check_stop()
+                m.execute(plan["lift"] + plan["tuck"] + plan["pre"],
+                          preview=False, clear_stop=False)
+                check_stop()
+                time.sleep(min(settle, 0.2))
+                check_stop()
+                i0 = self._sample_currents(["J2", "J3"], stop_event=self._park_stop)
+                check_stop()
                 self.park_step.update({"phase": "at_pre", "I0": i0})
                 sgn = 1.0 if (i0.get("J2") or 0.0) >= 0 else -1.0
                 # 4：1 mm/步分步下降找接触（q2+q3=90，前臂保持水平）
@@ -1043,13 +1283,17 @@ class Executor:
                 lowest = None
                 contact = False
                 while z > z_min + 1e-6:
+                    check_stop()
                     nz = max(z_min, round(z - step_mm, 3))
-                    segs = m._plan_move(cur_q, q_at_j4z(nz), f"分步下降 z={nz:.1f}")
-                    m.execute(segs, preview=False)
+                    segs = m._plan_move(cur_q, self._park_q_at_z(nz, q1),
+                                        f"分步下降 z={nz:.1f}")
+                    m.execute(segs, preview=False, clear_stop=False)
+                    check_stop()
                     time.sleep(0.15)
                     cur_q = m.read_q()
                     z = nz
-                    i2 = self._sample_currents(["J2"]).get("J2")
+                    i2 = self._sample_currents(["J2"], stop_event=self._park_stop).get("J2")
+                    check_stop()
                     lowest = i2
                     self.park_step.update({"phase": "descending", "z": round(z, 2),
                                            "step": int(round((168.0 - z) / step_mm)),
@@ -1059,8 +1303,9 @@ class Executor:
                         self.park_step["contact_z"] = round(z, 2)
                         break
                 if not contact:
+                    check_stop()
                     back = m._plan_move(cur_q, pre_q, "回预停机点")
-                    m.execute(back, preview=False)
+                    m.execute(back, preview=False, clear_stop=False)
                     self.park_step.update({"phase": "catch_failed",
                                            "lowest_I2": lowest, "z": round(z, 2)})
                     self.msg = (f"搁架没接住：I₀ {i0.get('J2')} A，降到 z={z:.1f} 时 J2 电流 "
@@ -1068,14 +1313,18 @@ class Executor:
                                 "检查搁架位置/垫片后可以直接再按“停机”重做，或点“恢复”。")
                     return
                 # 再多走一步让搁架接实，然后读 I₁
+                check_stop()
                 if z > z_min + 1e-6:
                     nz = max(z_min, round(z - step_mm, 3))
-                    segs = m._plan_move(cur_q, q_at_j4z(nz), f"再走一步 z={nz:.1f}")
-                    m.execute(segs, preview=False)
+                    segs = m._plan_move(cur_q, self._park_q_at_z(nz, q1),
+                                        f"再走一步 z={nz:.1f}")
+                    m.execute(segs, preview=False, clear_stop=False)
                     z = nz
                     cur_q = m.read_q()
-                time.sleep(settle)
-                i1 = self._sample_currents(["J2", "J3"])
+                check_stop()
+                time.sleep(min(settle, 0.2))
+                i1 = self._sample_currents(["J2", "J3"], stop_event=self._park_stop)
+                check_stop()
                 self.park_step.update({"phase": "at_park", "I1": i1, "z": round(z, 2)})
                 # 7：写 parked_q（取失能前最后一次读到的值）
                 q_park = m.read_q()
@@ -1088,16 +1337,22 @@ class Executor:
                 order = list(self.park_cfg.get("disable_order") or
                              ["J6", "J5", "J4", "J3", "J2", "J1"])
                 for name in order:
+                    check_stop()
                     raw_before = self.bus.read_positions_turns()
                     if name not in raw_before:
-                        self.bus.hold_all()
+                        res = self.bus.hold_all()
                         self.park_step.update({"phase": "disable_aborted",
-                                               "reason": f"{name} 失能前读不到位置"})
+                                               "reason": f"{name} 失能前读不到位置",
+                                               "disabled": list(disabled)})
                         self.msg = (f"停机在失能 {name} 前读不到它的位置，"
                                     "已停在保持、没有继续失能")
+                        if disabled:
+                            self.bus.startup_done = False
                         return
                     self.bus.disable_one(name)
+                    disabled.append(name)
                     time.sleep(gap)
+                    check_stop()
                     raw_after = self.bus.read_positions_turns()
                     moved = {}
                     for k, v in raw_before.items():
@@ -1110,27 +1365,64 @@ class Executor:
                     if moved:
                         self.bus.enable_one_hold(name, raw_before.get(name, 0.0))
                         self.park_step.update({"phase": "disable_aborted",
-                                               "moved": moved})
+                                               "moved": moved,
+                                               "disabled": [x for x in disabled if x != name]})
                         self.msg = (f"失能 {name} 时这些关节动了 {moved}°，"
                                     f"已把 {name} 重新使能到保持并停止停机流程；"
                                     "请检查支撑后再处理。")
+                        self.bus.startup_done = False
                         return
                     self.park_step["phase"] = f"disabled_{name}"
-                self.park_step.update({"phase": "parked"})
+                    self.park_step["disabled"] = list(disabled)
+                self.park_step.update({"phase": "parked", "disabled": list(disabled)})
+                self.bus.startup_done = False
                 self.msg = "已停机（搁架接住，六颗按 J6→J1 失能），可以关电源"
+            except _ParkStop:
+                hold_after_stop("用户按停")
             except MotionError as exc:
-                self.park_step.update({"phase": "aborted", "reason": str(exc)})
+                if self._park_stop.is_set():
+                    hold_after_stop("用户按停")
+                    return
+                with m._lock:
+                    if m.status.get("busy"):
+                        m.status.update({"busy": False, "phase": "aborted",
+                                         "reason": str(exc)})
+                res = best_hold()
+                un = (res or {}).get("unconfirmed") or []
+                self.park_step.update({"phase": "aborted", "reason": str(exc),
+                                       "disabled": list(disabled)})
+                if disabled:
+                    self.bus.startup_done = False
                 self.msg = f"停机中止：{exc}（臂保持使能，没有失能）"
+                if un:
+                    self.msg += "；保持未确认：" + "，".join(
+                        f"{x.get('name')}({x.get('reason')})" for x in un)
             except Exception as exc:  # noqa: BLE001
                 traceback.print_exc()
-                self.park_step.update({"phase": "error", "reason": str(exc)})
+                res = best_hold()
+                un = (res or {}).get("unconfirmed") or []
+                with m._lock:
+                    if m.status.get("busy"):
+                        m.status.update({"busy": False, "phase": "error",
+                                         "reason": str(exc)})
+                self.park_step.update({"phase": "error", "reason": str(exc),
+                                       "disabled": list(disabled)})
+                if disabled:
+                    self.bus.startup_done = False
                 self.msg = f"停机失败：{exc}"
+                if un:
+                    self.msg += "；保持未确认：" + "，".join(
+                        f"{x.get('name')}({x.get('reason')})" for x in un)
+            finally:
+                self.park_active = False
 
-        self._park_thread = threading.Thread(target=worker, daemon=True)
-        self._park_thread.start()
+        thread = threading.Thread(target=worker, daemon=True)
+        self._park_thread = thread
+        thread.start()
 
     def unpark(self, preview: bool = False, confirmed: bool = False) -> dict:
         """从停机启动：J2/J3 同步抬回预停机点（离开搁架）。"""
+        self._reject_if_parking()
         m = self.planning_motion()
         if m.status.get("busy"):
             raise MotionError("正在运动，先按停")
@@ -1156,13 +1448,18 @@ class Executor:
 
     def recover(self) -> dict:
         """16.4 第 7 条：中止后保持状态的出口“恢复”。"""
+        self._reject_if_parking()
         if not self.bus or not self.motion:
             raise MotionError("还没连接")
         if self.motion.status.get("busy"):
             raise MotionError("还在运动/预演，不能恢复")
         if self.motion.status.get("phase") not in ("aborted", "error", "stopping"):
             raise MotionError("当前不在中止保持状态")
-        self.bus.hold_all()
+        res = self.bus.hold_all()
+        un = (res or {}).get("unconfirmed") or []
+        if un:
+            raise MotionError("恢复前保持未确认：" + "，".join(
+                f"{x.get('name')}({x.get('reason')})" for x in un))
         with self.motion._lock:
             self.motion.status.update({"phase": "idle", "reason": "", "label": ""})
         self.hold["since"] = None
@@ -1174,6 +1471,7 @@ class Executor:
 
     def support_park(self, confirmed: bool = False) -> dict:
         """扶持停机（备用）：回零位 + 用户扶住 + 二次确认 → 六颗一起失能。"""
+        self._reject_if_parking()
         if not confirmed:
             raise MotionError("扶持停机要二次确认（提示：臂在零位且已扶住）")
         if not self.bus or not self.motion:
@@ -1198,9 +1496,11 @@ class Executor:
                 "note": "J5 一组要等夹爪装回；挂重只在保持状态下加减，人不要站在 +x"}
 
     def kt_goto(self, q, preview: bool = False) -> dict:
+        self._reject_if_parking()
         return self.move_joints(q, preview=preview, descend=False)
 
     def kt_sample(self, joints, load_kg: float = 0.0, label: str = "") -> dict:
+        self._reject_if_parking()
         if not self.use_actual():
             raise MotionError("Kt 标定要连真机并已使能")
         if not getattr(self.bus, "startup_done", False):
@@ -1264,8 +1564,11 @@ class Executor:
 
     # ---------------- 维护：只写限位/限流/限速，不动零位 ----------------
     def write_limits_all(self) -> dict:
+        self._reject_if_parking()
         if not self.bus or not self.motion:
             raise MotionError("还没连接")
+        if self.config_stale:
+            raise MotionError(self.config_stale_msg or "配置已变，请重新连接")
         if self.calib.active or self.motion.status.get("busy"):
             raise MotionError("校准/运动进行中，先停")
         if self.drag_active:
@@ -1301,6 +1604,8 @@ class Executor:
             lim = m.pos_limits_turns()
             spd = m.speed_limit_rpm()
             cur = m.current_limit_a()
+            if cur is not None and hasattr(self.bus, "current_limit_readback"):
+                self.bus.current_limit_readback[name] = float(cur)
             ok = (lim is not None and abs(lim[0] - lo_t) < 0.01
                   and abs(lim[1] - hi_t) < 0.01
                   and spd is not None and abs(spd - 360.0) < 1.0)
@@ -1328,6 +1633,7 @@ class Executor:
 
     # ---------------- 清除报警锁存（不发运动/使能） ----------------
     def clear_errors(self, joint: str | None = None) -> dict:
+        self._reject_if_parking()
         if not self.bus:
             raise MotionError("还没连接")
         if self.calib.active or self.drag_active or self.motion.status.get("busy"):
@@ -1421,6 +1727,7 @@ class Executor:
 
     # ---------------- 零扭矩拖动 / 手动测量 ----------------
     def drag_start(self, confirmed: bool = False) -> dict:
+        self._reject_if_parking()
         if not confirmed:
             raise MotionError("零扭矩拖动要确认臂已扶住/支撑")
         if not self.bus or not self.motion:
@@ -1646,7 +1953,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------------- 响应 ----------------
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # 20.9.5：只回显执行器自己的地址，不再用 *。
+        port = int(getattr(self.server, "server_port", 0) or 8770)
+        origin = self.headers.get("Origin") or ""
+        allowed = {f"http://127.0.0.1:{port}", f"http://localhost:{port}",
+                   f"http://[::1]:{port}"}
+        if origin and origin in allowed:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
@@ -1729,6 +2043,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, EXEC.kt_points())
             if p == "/api/ping":
                 return self._json(200, {"ok": True, "t": time.time()})
+            if p == "/api/mock/faults":
+                if not isinstance(EXEC.bus, MockJointBus):
+                    raise MotionError("仅 mock 模式可用")
+                return self._json(200, {"ok": True, **EXEC.bus.mock_faults()})
             return self._static(p)
         except Exception as exc:  # noqa: BLE001
             return self._json(500, {"ok": False, "error": str(exc)})
@@ -1747,7 +2065,8 @@ class Handler(BaseHTTPRequestHandler):
             # 控制权 / 心跳
             if p == "/api/acquire":
                 r = EXEC.acquire(str(body.get("client_id") or ""),
-                                 str(body.get("config_version") or ""))
+                                 str(body.get("config_version") or ""),
+                                 str(body.get("token") or ""))
                 return self._json(200, {"ok": True, **r})
             if p == "/api/heartbeat":
                 r = EXEC.heartbeat(str(body.get("token") or ""))
@@ -1756,13 +2075,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, EXEC.release(str(body.get("token") or "")))
             if p == "/api/stop":
                 # 停是安全动作：不要求控制权，任何客户端都能停
-                if EXEC.calib.active:
-                    EXEC.calib.abort(reason="用户按停")
-                elif EXEC.drag_active:
-                    EXEC.drag_stop()
-                elif EXEC.motion:
-                    EXEC.motion.stop()
-                return self._json(200, {"ok": True})
+                return self._json(200, EXEC.stop_all("用户按停"))
+            if p == "/api/mock/fault":
+                # 20.0：仅 mock 的故障注入开关
+                if not isinstance(EXEC.bus, MockJointBus):
+                    raise MotionError("仅 mock 模式可用")
+                EXEC.require_control(body)
+                if body.get("clear"):
+                    EXEC.bus.clear_faults()
+                else:
+                    EXEC.bus.set_faults(
+                        silent=body.get("silent"),
+                        drop=body.get("drop"),
+                        delay=body.get("delay"),
+                        error_bits=body.get("error_bits"),
+                        limits=body.get("limits"),
+                        mode=body.get("mode"),
+                        currents=body.get("currents"))
+                return self._json(200, {"ok": True, **EXEC.bus.mock_faults()})
             if p == "/api/debug/page_state":
                 # 调试快照：不要求控制权，任何页面（包括只读）都可写；只写最新一份
                 return self._json(200, EXEC.save_web_state(body))
@@ -1827,8 +2157,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "calib": r})
             if p == "/api/connect":
                 EXEC.require_control(body)
-                if EXEC.motion and EXEC.motion.status.get("busy"):
-                    raise MotionError("正在运动/预演，先按停再重连")
+                if EXEC.is_busy():
+                    raise MotionError("正在运动/停机流程/预演，先按停再重连")
                 if EXEC.drag_active:
                     raise MotionError("零扭矩拖动中，先锁定保持")
                 r = EXEC.connect(body.get("mode", "mock"),
@@ -1839,8 +2169,10 @@ class Handler(BaseHTTPRequestHandler):
                 EXEC.require_control(body)
                 if not EXEC.bus:
                     raise MotionError("还没连接")
-                if EXEC.motion and EXEC.motion.status.get("busy"):
-                    raise MotionError("正在运动/预演，先按停")
+                if EXEC.config_stale:
+                    raise MotionError(EXEC.config_stale_msg or "配置已变，请重新连接")
+                if EXEC.is_busy():
+                    raise MotionError("正在运动/停机流程/预演，先按停")
                 if EXEC.drag_active:
                     raise MotionError("零扭矩拖动中，先锁定保持")
                 rep = EXEC.bus.enable_all(bool(body.get("confirmed_supported")))
@@ -1908,6 +2240,8 @@ class Handler(BaseHTTPRequestHandler):
                 EXEC.require_control(body)
                 if not EXEC.bus:
                     raise MotionError("还没连接")
+                if EXEC.park_active or (EXEC._park_thread and EXEC._park_thread.is_alive()):
+                    raise MotionError("停机流程正在跑：先按停，它会停在保持")
                 if EXEC.motion and EXEC.motion.status.get("busy"):
                     raise MotionError("运动/预演中不能全部失能；先按停")
                 if EXEC.drag_active:
@@ -1966,6 +2300,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, EXEC.kt_reset())
             if p == "/api/tcp":
                 EXEC.require_control(body)
+                EXEC._reject_if_parking()
                 if EXEC.motion and EXEC.motion.status.get("busy"):
                     raise MotionError("运动/预演中不能换 TCP 预设")
                 name = body.get("preset", "probe")
@@ -1987,6 +2322,7 @@ class Handler(BaseHTTPRequestHandler):
                                         "yaw": EXEC.yaw_deg})
             if p == "/api/yaw":
                 EXEC.require_control(body)
+                EXEC._reject_if_parking()
                 if EXEC.motion and EXEC.motion.status.get("busy"):
                     raise MotionError("运动/预演中不能改偏航")
                 EXEC.yaw_deg = float(body.get("yaw", 0.0))
@@ -1996,6 +2332,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "yaw": EXEC.yaw_deg})
             if p == "/api/exec_mode":
                 EXEC.require_control(body)
+                EXEC._reject_if_parking()
                 mode = body.get("mode", "preview")
                 if mode not in ("preview", "direct"):
                     raise MotionError("mode 只能是 preview 或 direct")

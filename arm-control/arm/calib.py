@@ -348,16 +348,22 @@ class CalibSession:
         today = _dt.date.today().isoformat()
         patch_joint(self.joint, zero_date=today)
         self.ex.refresh_config_version()
+        if cur2 is not None and getattr(self.ex, "bus", None) is not None:
+            try:
+                self.ex.bus.current_limit_readback[self.joint] = float(cur2)
+            except Exception:  # noqa: BLE001
+                pass
         self.params = {
             "limits_deg": [lim[0], lim[1]],
             "current_limit_a": None if cur2 is None else round(cur2, 3),
             "speed_limit_rpm": None if spd2 is None else round(spd2, 1),
             "zero_date": today,
         }
-        # 进入位置模式，准备方向核对
-        m.set_mode(MODE_PROFILE_POSITION)
-        m.set_profile_out(5.0, 5.0)
+        # 进入位置模式，准备方向核对（20.9.1：先写目标，再切模式，再写一次）
         pos_now = m.pos_turns() or 0.0
+        m.set_target_turns(pos_now)
+        m.set_profile_out(5.0, 5.0)
+        m.set_mode(MODE_PROFILE_POSITION)
         m.set_target_turns(pos_now)
         self._set(stage="zeroed",
                   msg=f"{self.joint} 零位已存（{today}）。下一步：按电机正方向点动 +5°。")
@@ -369,11 +375,13 @@ class CalibSession:
         self._require(self.joint, ("zeroed", "jogged"))
         m = self.motor
         assert m is not None
-        m.set_mode(MODE_PROFILE_POSITION)
-        m.set_profile_out(5.0, 5.0)
         p0 = m.pos_turns()
         if p0 is None:
             raise RuntimeError("读不到位置")
+        # 20.9.1：先写目标=当前位置，再切模式，再写一次
+        m.set_target_turns(p0)
+        m.set_profile_out(5.0, 5.0)
+        m.set_mode(MODE_PROFILE_POSITION)
         m.set_target_turns(p0)
         time.sleep(0.2)
         p0 = m.pos_turns() or p0
@@ -410,8 +418,10 @@ class CalibSession:
         assert m is not None
         # 回 raw 0，失能
         try:
-            m.set_mode(MODE_PROFILE_POSITION)
+            # 20.9.1：先写目标=0，再切模式，再写一次
+            m.set_target_turns(0.0)
             m.set_profile_out(5.0, 5.0)
+            m.set_mode(MODE_PROFILE_POSITION)
             m.set_target_turns(0.0)
             t0 = time.monotonic()
             while time.monotonic() - t0 < 5.0:
