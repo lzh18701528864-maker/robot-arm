@@ -65,6 +65,20 @@ docs/screenshot.png       README 截图
 
 `runs/` 是运行时生成的 CSV/快照目录，不提交到仓库。
 
+## 维护与发布（给维护者）
+
+本仓库是**发布副本**，源码在项目根目录的 `arm-control/`（本仓库位于 `dist/robot-arm-web/`）。
+
+- 开发只改根目录的 `arm-control/`，**不要手改本仓库里的 `arm-control/`** —— 下次同步会覆盖。
+- 发布：在项目根目录运行 `./同步并推送.command`（该脚本在项目根目录，不在本仓库里），
+  它会依次做 rsync 同步 → 版本校验 → 提交 → `git push`。
+  - `--dry-run` 只看差异不动文件；`--no-push` 只提交不推送；`--yes` 全自动不确认。
+- 改网页时必须同时改 `arm-control/web/version.json` 和 `app.js` 里的 `WEB_VERSION`。
+  脚本会校验两者一致，并拦下「文件有改动但版本号没变」的提交。
+- `dist/robot-arm-web-v*.zip` 是发布包，放在仓库外，不提交。
+
+`README.md`、`requirements.txt`、`.gitignore`、`docs/` 只存在于本仓库，同步时不会被覆盖。
+
 ## 版本
 
 - 网页：`v2026-11-13.1`
